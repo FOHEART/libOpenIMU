@@ -54,6 +54,8 @@
 /* 调试开关：打印 UART6 收到的原始数据与响应行（定位初始化失败用） */
 #define LIBOPENIMU_DEBUG_PRINT (0)
 
+
+
 /* 运行状态与平台 IO（实例由 libOpenIMU_portable 提供，经 libOpenIMU_Init 传入） */
 static libOpenIMU_TypeDef *sLibOpenIMU;
 static const libOpenIMU_IO *sLibOpenIMU_IO;
@@ -593,7 +595,7 @@ static bool libOpenIMU_TryParseHexFrame(void)
         libOpenIMU_ParseHexFrameData(sLibOpenIMU->rxBuf);
         sLibOpenIMU->rxLen -= hexFrameDataBytes;
         memmove(sLibOpenIMU->rxBuf, sLibOpenIMU->rxBuf + hexFrameDataBytes, sLibOpenIMU->rxLen);
-        //libOpenIMU_PrintFrame();
+        libOpenIMU_PrintFrame();
         return true;
     }
     return false;
@@ -713,15 +715,12 @@ bool libOpenIMU_GetFrame(libOpenIMU_Frame *pFrame)
     return true;
 }
 
-/***********************************************************
- * Function:        libOpenIMU_PrintFrame
- * Description:     打印最新有效帧（调试用）
- * Input:
- * Input:
- * Output:
- * Return:
- * Others:          Other Description.
- ***********************************************************/
+/* 打印开关：libOpenIMU_PrintFrame 中各数据组可单独控制打印（1=打印，0=不打印） */
+#define LIBOPENIMU_PRINT_QUAT  (1)  /* 四元数 */
+#define LIBOPENIMU_PRINT_ACCEL (0)  /* 加速度计 */
+#define LIBOPENIMU_PRINT_GYRO  (0)  /* 陀螺仪 */
+#define LIBOPENIMU_PRINT_MAG   (0)  /* 磁力计 */
+
 void libOpenIMU_PrintFrame(void)
 {
     libOpenIMU_Frame *pFrame = &sLibOpenIMU->frame;
@@ -732,13 +731,22 @@ void libOpenIMU_PrintFrame(void)
         return;
     }
 
-    printf("[OpenIMU] t=%lu q(wxyz)=%.4f,%.4f,%.4f,%.4f "
-           "a(g)=%.3f,%.3f,%.3f "
-           "g(dps)=%.3f,%.3f,%.3f "
-           "mag(uT)=%.3f,%.3f,%.3f\r\n",
-           (unsigned long)pFrame->timestampMs,
-           pFrame->quat_wxyz[0], pFrame->quat_wxyz[1], pFrame->quat_wxyz[2], pFrame->quat_wxyz[3],
-           pFrame->accel_g[0], pFrame->accel_g[1], pFrame->accel_g[2],
-           pFrame->gyro_dps[0], pFrame->gyro_dps[1], pFrame->gyro_dps[2],
+    printf("[OpenIMU] t=%lu", (unsigned long)pFrame->timestampMs);
+#if (LIBOPENIMU_PRINT_QUAT == 1)
+    printf(" q(wxyz)=%.4f,%.4f,%.4f,%.4f",
+           pFrame->quat_wxyz[0], pFrame->quat_wxyz[1], pFrame->quat_wxyz[2], pFrame->quat_wxyz[3]);
+#endif
+#if (LIBOPENIMU_PRINT_ACCEL == 1)
+    printf(" a(g)=%.3f,%.3f,%.3f",
+           pFrame->accel_g[0], pFrame->accel_g[1], pFrame->accel_g[2]);
+#endif
+#if (LIBOPENIMU_PRINT_GYRO == 1)
+    printf(" g(dps)=%.3f,%.3f,%.3f",
+           pFrame->gyro_dps[0], pFrame->gyro_dps[1], pFrame->gyro_dps[2]);
+#endif
+#if (LIBOPENIMU_PRINT_MAG == 1)
+    printf(" mag(uT)=%.3f,%.3f,%.3f",
            pFrame->mag_uT[0], pFrame->mag_uT[1], pFrame->mag_uT[2]);
+#endif
+    printf("\r\n");
 }
