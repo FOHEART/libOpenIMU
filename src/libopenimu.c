@@ -696,15 +696,6 @@ void libOpenIMU_Poll(void)
     }
 }
 
-/***********************************************************
- * Function:        libOpenIMU_GetFrame
- * Description:     获取最新有效帧（拷贝），无有效帧返回 false
- * Input:
- * Input:
- * Output:
- * Return:
- * Others:          Other Description.
- ***********************************************************/
 bool libOpenIMU_GetFrame(libOpenIMU_Frame *pFrame)
 {
     if (pFrame == NULL || !sLibOpenIMU->frameValid)
@@ -748,5 +739,6 @@ void libOpenIMU_PrintFrame(void)
     printf(" mag(uT)=%.3f,%.3f,%.3f",
            pFrame->mag_uT[0], pFrame->mag_uT[1], pFrame->mag_uT[2]);
 #endif
+
     printf("\r\n");
 }
