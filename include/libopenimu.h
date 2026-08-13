@@ -48,6 +48,20 @@ typedef enum {
 	LIBOPENIMU_UPLOAD_FORMAT_HEX = 1      /**< 二进制 JustFloat（固定帧长） */
 }libOpenIMU_UploadFormat;
 
+/** @brief OpenIMU 模组支持的 UART 波特率（与 AT+UARTCFG 取值一致） */
+typedef enum {
+	LIBOPENIMU_BAUD_115200  = 0,  /**< 115200 */
+	LIBOPENIMU_BAUD_230400  = 1,  /**< 230400 */
+	LIBOPENIMU_BAUD_256000  = 2,  /**< 256000 */
+	LIBOPENIMU_BAUD_460800  = 3,  /**< 460800 */
+	LIBOPENIMU_BAUD_921600  = 4,  /**< 921600 */
+	LIBOPENIMU_BAUD_1000000 = 5,  /**< 1000000 */
+	LIBOPENIMU_BAUD_1500000 = 6,  /**< 1500000 */
+	LIBOPENIMU_BAUD_2000000 = 7,  /**< 2000000 */
+	LIBOPENIMU_BAUD_3000000 = 8,  /**< 3000000 */
+	LIBOPENIMU_BAUD_UNKNOWN  = 9  /**< 未探测到/未知（探测失败） */
+}libOpenIMU_BaudRate;
+
 /** @brief OpenIMU 开机初始化状态机 */
 typedef enum {
 	LIBOPENIMU_STATE_INIT                    = 0,  /*!< 上电/复位后初始，等待模组启动完成 */
@@ -78,7 +92,7 @@ typedef struct
 }libOpenIMU_Frame;
 #pragma pack()
 
-/** @brief 平台抽象：时间（ms/us）与串口读写
+/** @brief 平台抽象：时间（ms/us）、串口读写与模组电源控制
  * 由 portable 层实现并通过 libOpenIMU_Init 传入
  */
 #pragma pack(1)
@@ -86,10 +100,15 @@ typedef struct
 {
 	uint32_t ( *getTickMs )( void );                     /*!< 获取当前毫秒（支持 32 位回绕） */
 	uint32_t ( *getUs )( void );                         /*!< 获取当前微秒（自由运行计数器原始值） */
+	void ( *delayMs )( uint32_t ms );                    /*!< 延时等待（ms），基于 getTickMs 计时，由移植层实现 */
 	uint32_t ( *rxAvailable )( void );                   /*!< 串口可读字节数 */
 	uint32_t ( *read )( uint8_t *pBuf, uint32_t len );   /*!< 串口读，返回实际读取字节数 */
 	uint32_t ( *write )( const uint8_t *pData, uint32_t len ); /*!< 串口写 */
+	void ( *setBaudrate )( uint32_t baud );              /*!< 主机串口波特率切换（波特率探测用），由移植层实现 */
+	void ( *powerOn )( void );                           /*!< 模组电源开启，由移植层实现 */
+	void ( *powerOff )( void );                          /*!< 模组电源关闭，由移植层实现 */
 	uint32_t fullCycleUs;                                /*!< 微秒计数器满周期（us），用于回绕计算 */
+	uint32_t bootInitDelayMs;                            /*!< 上电后等待模组初始化完成延时（ms），默认 LIBOPENIMU_BOOT_INIT_DELAY_MS */
 	XFPK_Type ( *getXfpkType )( void );                  /*!< 读取节点配置的算法滤波类型 */
 }libOpenIMU_IO;
 #pragma pack()
@@ -98,6 +117,12 @@ typedef struct
  * @brief UART6 接收累积缓冲大小（缓存未成行的数据）
  */
 #define LIBOPENIMU_RX_BUF_SIZE (128)
+
+/** @def LIBOPENIMU_BOOT_INIT_DELAY_MS
+ * @brief 上电后等待模组初始化完成的延时（ms），默认 300ms
+ *        承载于 libOpenIMU_IO.bootInitDelayMs，由移植层上电流程使用
+ */
+#define LIBOPENIMU_BOOT_INIT_DELAY_MS (300)
 
 /** @brief OpenIMU 模块运行状态
  * 由 portable 层实例化，指针传入 libOpenIMU_Init
@@ -113,6 +138,7 @@ typedef struct
 	bool frameValid;                       /*!< 最新帧是否有效 */
 	XFPK_Type algFilterType;               /*!< 算法滤波类型（配置阶段应用） */
 	libOpenIMU_UploadFormat uploadFormat;  /*!< 上传格式（libOpenIMU_Init 参数传入） */
+	libOpenIMU_BaudRate baud;              /*!< 探测到的模组当前波特率（libOpenIMU_Init 探测确定） */
 	libOpenIMU_Frame frame;                /*!< 最新有效帧 */
 	uint8_t rxBuf[LIBOPENIMU_RX_BUF_SIZE]; /*!< UART6 接收累积缓冲 */
 	uint16_t rxLen;                        /*!< 累积缓冲有效长度 */
@@ -129,6 +155,14 @@ typedef struct
  * @note 需在调用本函数前完成底层串口（UART6）初始化
  */
 void libOpenIMU_Init( libOpenIMU_IO *pIo, libOpenIMU_TypeDef *pInst, libOpenIMU_UploadFormat uploadFormat );
+
+/**
+ * @brief 探测 OpenIMU 模组当前使用的波特率
+ * @retval 命中返回对应的 libOpenIMU_BaudRate 枚举；全部候选均未命中返回 LIBOPENIMU_BAUD_UNKNOWN
+ * @note  需 libOpenIMU_IO.setBaudrate 回调（由移植层提供）；遍历模组支持的波特率，逐档切换主机
+ *        串口、发送 AT\r\n 并等待 \r\nOK\r\n 响应；命中后主机串口即保持在探测到的波特率上
+ */
+libOpenIMU_BaudRate libOpenIMU_DetectBaudrate( void );
 
 /**
  * @brief 轮询处理 OpenIMU 模组（状态机推进、数据接收与解析）

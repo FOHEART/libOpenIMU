@@ -34,8 +34,6 @@
 
 /* 上传格式（字符串/二进制）由 libOpenIMU_Init 参数传入，经 libOpenIMU_TypeDef.uploadFormat 运行时选择 */
 
-/* 模组上电后等待其启动完成的时间 ms */
-#define LIBOPENIMU_BOOT_DELAY_MS (600)
 /* 初始化阶段每状态等待响应超时 ms */
 #define LIBOPENIMU_RESP_TIMEOUT_MS (200)
 /* 每状态最大重试次数 */
@@ -53,6 +51,12 @@
 
 /* 调试开关：打印 UART6 收到的原始数据与响应行（定位初始化失败用） */
 #define LIBOPENIMU_DEBUG_PRINT (0)
+
+/* 波特率探测：候选数（不含 LIBOPENIMU_BAUD_UNKNOWN 哨兵）与每档等待响应超时 ms */
+#define LIBOPENIMU_BAUD_COUNT ( ( int )( LIBOPENIMU_BAUD_UNKNOWN - LIBOPENIMU_BAUD_115200 ) )
+#define LIBOPENIMU_BAUD_DETECT_TIMEOUT_MS (100)
+/* 波特率探测用的 AT 在线测试命令 */
+#define LIBOPENIMU_CMD_AT "AT\r\n"
 
 
 
@@ -77,6 +81,12 @@ static bool libOpenIMU_ParseFrame(const char *line);
 static float libOpenIMU_BytesToFloatLE(const uint8_t *p);
 static void libOpenIMU_ParseHexFrameData(const uint8_t *data);
 static bool libOpenIMU_TryParseHexFrame(void);
+
+/* 波特率枚举 → 数值映射表（下标与 libOpenIMU_BaudRate 枚举序一致，不含 LIBOPENIMU_BAUD_UNKNOWN） */
+static const uint32_t libOpenIMU_BaudValue[LIBOPENIMU_BAUD_COUNT] = {
+    115200, 230400, 256000, 460800, 921600,
+    1000000, 1500000, 2000000, 3000000
+};
 
 /***********************************************************
  * Function:        libOpenIMU_SetState
@@ -637,8 +647,71 @@ static void libOpenIMU_RequestFrame(void)
 }
 
 /***********************************************************
+ * Function:        libOpenIMU_DetectBaudrate
+ * Description:     探测 OpenIMU 模组当前使用的波特率：遍历支持的波特率，
+ *                  逐档切换主机串口、发送 AT\r\n 并等待 \r\nOK\r\n 响应
+ * Input:
+ * Input:
+ * Output:
+ * Return:          命中返回对应 libOpenIMU_BaudRate；全部未命中返回 LIBOPENIMU_BAUD_UNKNOWN
+ * Others:          命中后主机串口即保持在探测到的波特率上，无需再次切换
+ ***********************************************************/
+libOpenIMU_BaudRate libOpenIMU_DetectBaudrate(void)
+{
+    uint32_t i;
+    char line[LIBOPENIMU_LINE_BUF_SIZE];
+
+    /* 未提供波特率切换回调：无法探测，按既有波特率继续 */
+    if (sLibOpenIMU_IO->setBaudrate == NULL)
+    {
+        printf("[OpenIMU] baud detect skipped: setBaudrate not provided.\r\n");
+        return LIBOPENIMU_BAUD_UNKNOWN;
+    }
+
+    for (i = 0; i < LIBOPENIMU_BAUD_COUNT; i++)
+    {
+        uint32_t startMs;
+        bool gotOk = false;
+
+        /* 切换主机串口波特率并排空 RX（丢弃旧波特率残留数据） */
+        sLibOpenIMU_IO->setBaudrate(libOpenIMU_BaudValue[i]);
+        libOpenIMU_DrainRx();
+
+        /* 发送 AT 在线测试命令 */
+        libOpenIMU_SendCmd(LIBOPENIMU_CMD_AT);
+
+        /* 短超时内等待精确的 OK 行（libOpenIMU_RxReadLine 已剥 CRLF） */
+        startMs = sLibOpenIMU_IO->getTickMs();
+        while (sLibOpenIMU_IO->getTickMs() - startMs < LIBOPENIMU_BAUD_DETECT_TIMEOUT_MS)
+        {
+            if (libOpenIMU_RxReadLine(line, sizeof(line)))
+            {
+                if (strcmp(line, "OK") == 0)
+                {
+                    gotOk = true;
+                    break;
+                }
+                /* 其他行（乱码/非 OK 响应）忽略 */
+            }
+        }
+
+        if (gotOk)
+        {
+            printf("[%d][OpenIMU] baud detected: %lu\r\n", sLibOpenIMU_IO->getTickMs(), (unsigned long)libOpenIMU_BaudValue[i]);
+            return (libOpenIMU_BaudRate)i;
+        }
+
+        /* 该档波特率未响应：打印以定位失败的波特率 */
+        printf("[%d][OpenIMU] baud probe failed: no OK response @ %lu\r\n", sLibOpenIMU_IO->getTickMs(), (unsigned long)libOpenIMU_BaudValue[i]);
+    }
+
+    printf("[OpenIMU] baud detect failed: no supported baud responded.\r\n");
+    return LIBOPENIMU_BAUD_UNKNOWN;
+}
+
+/***********************************************************
  * Function:        libOpenIMU_Init
- * Description:     初始化模块并复位状态机到 INIT
+ * Description:     初始化模块并复位状态机到 INIT（先探测波特率）
  * Input:
  * Input:
  * Output:
@@ -652,6 +725,10 @@ void libOpenIMU_Init(libOpenIMU_IO *pIo, libOpenIMU_TypeDef *pInst, libOpenIMU_U
     memset(sLibOpenIMU, 0, sizeof(*sLibOpenIMU));
     sLibOpenIMU->uploadFormat = uploadFormat;
     sLibOpenIMU->algFilterType = sLibOpenIMU_IO->getXfpkType();
+
+    /* 先探测模组当前波特率（成功后主机串口已保持在该波特率），再进入初始化状态机 */
+    sLibOpenIMU->baud = libOpenIMU_DetectBaudrate();
+
     libOpenIMU_SetState(LIBOPENIMU_STATE_INIT);
 }
 
@@ -669,12 +746,9 @@ void libOpenIMU_Poll(void)
     switch (sLibOpenIMU->state)
     {
     case LIBOPENIMU_STATE_INIT:
-        /* 等待模组启动完成后再开始配置 */
-        if (sLibOpenIMU_IO->getTickMs() - sLibOpenIMU->stateStartMs >= LIBOPENIMU_BOOT_DELAY_MS)
-        {
-            libOpenIMU_DrainRx();
-            libOpenIMU_SetState(LIBOPENIMU_STATE_SET_CONFIG_MODE);
-        }
+        /* 上电/启动等待已由移植层 libOpenIMU_Portable_Init（bootInitDelayMs）完成，直接进入配置阶段 */
+        libOpenIMU_DrainRx();
+        libOpenIMU_SetState(LIBOPENIMU_STATE_SET_CONFIG_MODE);
         break;
 
     case LIBOPENIMU_STATE_SET_CONFIG_MODE:

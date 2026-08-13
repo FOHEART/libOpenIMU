@@ -7,7 +7,7 @@
 ## 1. 概述
 
 - **libOpenIMU** 是 OpenIMU BNO086 模组（UART6，3Mbps）的协议驱动，用纯 C 编写，**不含任何平台相关代码**，可移植到任意 MCU/RTOS。
-- 平台能力通过函数指针结构体 **`libOpenIMU_IO`** 注入（时间、串口读写等）。
+- 平台能力通过函数指针结构体 **`libOpenIMU_IO`** 注入（时间、串口读写、波特率切换、电源控制等）。
 - 运行状态 `libOpenIMU_TypeDef` 实例由**移植层**持有，通过 `libOpenIMU_Init( io, inst, uploadFormat )` 传入协议逻辑（含上传格式）。
 - 本工程 AT32 移植层位于 `Project/bsp/libOpenIMU_portable.c`，是移植到其它 AT32 工程的**直接参考模板**。
 
@@ -16,7 +16,7 @@
 | 文件 | 作用 | 平台相关？ |
 |------|------|-----------|
 | `libOpenIMU/include/libopenimu.h` | 公共头：`libOpenIMU_Frame`、`XFPK_Type`、`libOpenIMU_State`、`libOpenIMU_IO`、`libOpenIMU_TypeDef`、API | 否 |
-| `libOpenIMU/src/libopenimu.c` | 协议逻辑：初始化状态机、AT 指令、帧解析、超时重试 | **否（纯算法）** |
+| `libOpenIMU/src/libopenimu.c` | 协议逻辑：初始化状态机（含波特率探测）、AT 指令、帧解析、超时重试 | **否（纯算法）** |
 | `Project/bsp/libOpenIMU_portable.h` | 移植层接口（`libOpenIMU_Portable_Init`） | 是 |
 | `Project/bsp/libOpenIMU_portable.c` | 移植层实现：实例化 `libOpenIMU_IO` + 状态，实现平台函数 | 是 |
 
@@ -24,17 +24,22 @@
 
 ## 2. 平台抽象接口（libOpenIMU_IO）
 
-`libOpenIMU` 只通过 `libOpenIMU_IO` 访问平台，移植时**必须**实现以下成员：
+`libOpenIMU` 只通过 `libOpenIMU_IO` 访问平台。**必须**实现的成员：时间（`getTickMs`/`getUs`/`fullCycleUs`/`delayMs`）与串口（`rxAvailable`/`read`/`write`）；**可选**成员：`setBaudrate`（波特率探测）、`powerOn`/`powerOff`（电源控制）、`bootInitDelayMs`（上电等待）、`getXfpkType`（滤波类型）。
 
 ```c
 typedef struct
 {
     uint32_t ( *getTickMs )( void );                     /* 获取当前毫秒（支持 32 位回绕） */
     uint32_t ( *getUs )( void );                         /* 获取当前微秒（自由运行计数器原始值） */
+    void ( *delayMs )( uint32_t ms );                    /* 忙等延时（ms），基于 getTickMs 计时 */
     uint32_t ( *rxAvailable )( void );                   /* 串口可读字节数 */
     uint32_t ( *read )( uint8_t *pBuf, uint32_t len );   /* 串口读，返回实际读取字节数 */
     uint32_t ( *write )( const uint8_t *pData, uint32_t len ); /* 串口写 */
+    void ( *setBaudrate )( uint32_t baud );              /* 主机串口波特率切换（波特率探测用，可选） */
+    void ( *powerOn )( void );                           /* 模组电源开启（可选） */
+    void ( *powerOff )( void );                          /* 模组电源关闭（可选） */
     uint32_t fullCycleUs;                                /* 微秒计数器满周期（us），用于回绕计算 */
+    uint32_t bootInitDelayMs;                            /* 上电后等待模组初始化完成延时（ms），默认 300（可选） */
     XFPK_Type ( *getXfpkType )( void );                  /* 读取节点配置的算法滤波类型（可选） */
 }libOpenIMU_IO;
 ```
@@ -43,10 +48,15 @@ typedef struct
 |------|----------|------------------------------------------|
 | `getTickMs` | 返回毫秒计数；用于状态机超时/启动延时 | `HAL_GetTick()` |
 | `getUs` | 返回**自由运行计数器原始值**（1MHz）；用于帧等待 3ms 超时 | `(uint32_t)MAIN_TMR->CNT`（TMR3） |
+| `delayMs` | 忙等延时 `ms` 毫秒，基于 `getTickMs` 计时（可替代 `HAL_Delay`） | `libOpenIMU_Portable_DelayMs`（`getTickMs()` 差值忙等） |
 | `fullCycleUs` | 微秒计数器满周期（us），做 16 位回绕修正 | `(uint32_t)MAIN_TMR_DESC.fullCycleUs`（= 65536） |
 | `rxAvailable` | 返回接收缓冲当前可读字节数 | `UART6_RxAvailable()` |
 | `read` | 从接收缓冲读取最多 len 字节，返回实际读取数 | `UART6_Read( pBuf, len )` |
 | `write` | 发送 len 字节 | `UART6_SendFrame( pData, len )` |
+| `setBaudrate` | 主机串口波特率切换（波特率探测用）；为 NULL 时跳过探测，按既有波特率继续 | `UART6_SetBR( baud )` + 排空 RX |
+| `powerOn` | 模组电源开启（开机流程用） | `OpenIMU_PwrCtl_PowerOn()` |
+| `powerOff` | 模组电源关闭（开机流程用） | `OpenIMU_PwrCtl_PowerOff()` |
+| `bootInitDelayMs` | 上电后等待模组初始化完成延时（ms，默认 `LIBOPENIMU_BOOT_INIT_DELAY_MS`=300） | 初始化器中填 `LIBOPENIMU_BOOT_INIT_DELAY_MS` |
 | `getXfpkType` | 返回算法滤波类型（`XFPK_Base`/`XFPK_Additional`）；不需要时返回 `XFPK_Additional` | `StaConfig_getXfpkType()`（节点配置缓存） |
 
 > ⚠️ `getUs()` 返回的是**计数器原始值**，不是"自系统启动以来的微秒数"；回绕由协议逻辑用 `fullCycleUs` 修正。
@@ -92,20 +102,33 @@ void libOpenIMU_Portable_Init( libOpenIMU_UploadFormat uploadFormat );  /* 绑�
 
 ```c
 /* libOpenIMU_portable.c */
-#include "config.h"          /* 含 MAIN_TMR 宏（如需要） */
-#include "uart.h"            /* 你的串口驱动 */
+#include "config.h"          /* 含 MAIN_TMR、UART6_TASK_EN 宏（如需要） */
+#include "uart.h"            /* 你的串口驱动（UART6_*） */
 #include "timer.h"           /* 含 MAIN_TMR_DESC（如需要） */
 #include "at32f4xx.h"        /* HAL_GetTick 等 */
 #include "libopenimu.h"
+#include "gpio.h"            /* 模组电源控制（如需要） */
 
 /* 平台函数 */
 static uint32_t libOpenIMU_Portable_GetTickMs( void ) { return HAL_GetTick(); }
 static uint32_t libOpenIMU_Portable_GetUs( void )     { return (uint32_t)MAIN_TMR->CNT; }
+static void libOpenIMU_Portable_DelayMs( uint32_t ms )
+{
+    uint32_t startMs = gLibOpenIMU_IO.getTickMs();
+    while ( gLibOpenIMU_IO.getTickMs() - startMs < ms ) {}
+}
 static uint32_t libOpenIMU_Portable_RxAvailable( void ) { return UART6_RxAvailable(); }
 static uint32_t libOpenIMU_Portable_Read( uint8_t *pBuf, uint32_t len )
 { return UART6_Read( pBuf, len ); }
 static uint32_t libOpenIMU_Portable_Write( const uint8_t *pData, uint32_t len )
 { return UART6_SendFrame( pData, len ); }
+static void libOpenIMU_Portable_SetBaudrate( uint32_t baud )  /* 波特率探测用 */
+{
+    UART6_SetBR( baud );
+    while ( UART6_RxAvailable() > 0 ) { uint8_t t[16]; UART6_Read( t, sizeof( t ) ); }
+}
+static void libOpenIMU_Portable_PowerOn( void )  { OpenIMU_PwrCtl_PowerOn(); }   /* 模组电源开 */
+static void libOpenIMU_Portable_PowerOff( void ) { OpenIMU_PwrCtl_PowerOff(); }  /* 模组电源关 */
 static XFPK_Type libOpenIMU_Portable_GetXfpkType( void )
 { return XFPK_Additional; }   /* 有节点配置时改为 StaConfig_getXfpkType() */
 
@@ -114,21 +137,37 @@ static libOpenIMU_IO gLibOpenIMU_IO =
 {
     .getTickMs   = libOpenIMU_Portable_GetTickMs,
     .getUs       = libOpenIMU_Portable_GetUs,
+    .delayMs     = libOpenIMU_Portable_DelayMs,
     .rxAvailable = libOpenIMU_Portable_RxAvailable,
     .read        = libOpenIMU_Portable_Read,
     .write       = libOpenIMU_Portable_Write,
+    .setBaudrate = libOpenIMU_Portable_SetBaudrate,
+    .powerOn     = libOpenIMU_Portable_PowerOn,
+    .powerOff    = libOpenIMU_Portable_PowerOff,
+    .bootInitDelayMs = LIBOPENIMU_BOOT_INIT_DELAY_MS,   /* 默认 300ms */
     .getXfpkType = libOpenIMU_Portable_GetXfpkType,
 };
 static libOpenIMU_TypeDef gLibOpenIMU;
 
 void libOpenIMU_Portable_Init( libOpenIMU_UploadFormat uploadFormat )
 {
+    /* 开机流程（若需电源控制）：断电 → 100ms → 打开 UART6 → 上电 → 等待模组初始化 */
+    gLibOpenIMU_IO.powerOff();
+    gLibOpenIMU_IO.delayMs( 100 );
+#if (UART6_TASK_EN == 1)
+    UART6_Open();
+#endif
+    gLibOpenIMU_IO.powerOn();
+    gLibOpenIMU_IO.delayMs( gLibOpenIMU_IO.bootInitDelayMs );
+
     gLibOpenIMU_IO.fullCycleUs = (uint32_t)MAIN_TMR_DESC.fullCycleUs;
     libOpenIMU_Init( &gLibOpenIMU_IO, &gLibOpenIMU, uploadFormat );
 }
 ```
 
 > 💡 上传格式（`LIBOPENIMU_UPLOAD_FORMAT_STRING` / `LIBOPENIMU_UPLOAD_FORMAT_HEX`）不再用编译期宏写死，而是作为 `libOpenIMU_Init` 的参数传入，同一份固件可在运行时选择字符串或二进制解析。
+
+> 💡 `setBaudrate` / `powerOn` / `powerOff` / `bootInitDelayMs` 为**可选**：`setBaudrate==NULL` 时 `libOpenIMU_Init` 跳过波特率探测（按既有波特率继续）；无电源控制需求时可将 `powerOn`/`powerOff` 置空，并在 `libOpenIMU_Portable_Init` 中去掉对应开机时序。
 
 > 💡 `fullCycleUs` **不能**放在静态初始化器里（`MAIN_TMR_DESC.fullCycleUs` 是全局数组的运行时值，IAR 报 `Error[Pe028]`），必须在 `Init()` 运行时赋值——这就是参考实现放在 `libOpenIMU_Portable_Init()` 中的原因。
 
@@ -138,8 +177,9 @@ void libOpenIMU_Portable_Init( libOpenIMU_UploadFormat uploadFormat )
    ```c
    libOpenIMU_Portable_Init( LIBOPENIMU_UPLOAD_FORMAT_HEX );
    ```
-   - 内部完成：`fullCycleUs` 填充 → `libOpenIMU_Init( &gLibOpenIMU_IO, &gLibOpenIMU, uploadFormat )`
-   - `libOpenIMU_Init` 会读取 `getXfpkType()` 存到 `algFilterType`、保存 `uploadFormat`，并把状态机复位到 `LIBOPENIMU_STATE_INIT`（等待模组启动 ~600ms 后开始自动配置）。
+   - 内部完成开机流程：**断电 → 等待 100ms → 打开 UART6 → 上电 → 等待模组初始化（`bootInitDelayMs`，默认 300ms）** → `fullCycleUs` 填充 → `libOpenIMU_Init( &gLibOpenIMU_IO, &gLibOpenIMU, uploadFormat )`；
+   - `libOpenIMU_Init` 会先调用 `libOpenIMU_DetectBaudrate()` 探测模组当前波特率（遍历 `libOpenIMU_BaudRate`，逐档经 `setBaudrate` 切换主机串口、发 `AT\r\n` 等待 `\r\nOK\r\n`），命中后主机串口即保持在该波特率；随后读取 `getXfpkType()` 存到 `algFilterType`、保存 `uploadFormat`，并把状态机复位到 `LIBOPENIMU_STATE_INIT`（该状态不再延时，开机等待已由移植层 `bootInitDelayMs` 完成，进入后直接开始配置）；
+   - **开机/电源时序已内置于本函数**，`IMUSample_task` 无需再写断电/上电/开串口代码。
 
 2. **周期任务中**反复调用（本工程在 IMUSample_task 主循环）：
    ```c
@@ -198,6 +238,9 @@ if ( libOpenIMU_GetFrame( &frame ) )
 | 配置 | 位置 | 说明 |
 |------|------|------|
 | 上传格式 | `libOpenIMU_Init`/`libOpenIMU_Portable_Init` 的 `uploadFormat` 参数（`LIBOPENIMU_UPLOAD_FORMAT_STRING` / `LIBOPENIMU_UPLOAD_FORMAT_HEX`） | 字符串 13 浮点 CSV，或二进制 52 字节 JustFloat；运行时选择 |
+| 波特率探测 | `libOpenIMU_IO.setBaudrate`（`libopenimu.c` 的 `libOpenIMU_DetectBaudrate`） | 遍历 `libOpenIMU_BaudRate` 探测模组当前波特率；`setBaudrate==NULL` 时跳过探测，按既有波特率继续 |
+| 开机等待延时 | `libOpenIMU_IO.bootInitDelayMs` / `LIBOPENIMU_BOOT_INIT_DELAY_MS`（`libopenimu.h`） | 上电后等待模组初始化完成（默认 300ms），`libOpenIMU_Portable_Init` 开机流程使用 |
+| 模组电源 | `libOpenIMU_IO.powerOn` / `powerOff` | 开机流程断电/上电；无电源控制需求时可置空并去掉对应时序 |
 | 滤波类型 | `getXfpkType()` 返回值 | `XFPK_Base`（游戏旋转矢量）/ `XFPK_Additional`（标准，默认）；配置阶段发 `AT+CONFIG=algFilterType,<value>` |
 | 状态 LED | 自动 | config 模式发 `AT+SETLED=OFF` 关闭 |
 | 调试打印 | `LIBOPENIMU_DEBUG_PRINT`（`libopenimu.c`） | 置 1 打印原始 RX/响应行/超时状态 |
@@ -206,10 +249,11 @@ if ( libOpenIMU_GetFrame( &frame ) )
 
 ## 7. 协议状态机（简介）
 
-初始化自动流程（`libOpenIMU_State`）：
+初始化自动流程：`libOpenIMU_Init` 先执行波特率探测，再进入状态机（`libOpenIMU_State`）：
 
 ```
-INIT(等待启动600ms)
+波特率探测（libOpenIMU_DetectBaudrate：遍历候选 → setBaudrate → 发 AT\r\n → 等 \r\nOK\r\n）
+  → INIT(直接开始配置，开机等待已由移植层 bootInitDelayMs 完成)
   → SET_CONFIG_MODE    (AT+MODE=config)
   → SET_LED_OFF        (AT+SETLED=OFF)
   → SET_ALG_FILTER     (AT+CONFIG=algFilterType,<value>)
@@ -227,7 +271,7 @@ INIT(等待启动600ms)
 
 | 现象 | 原因/排查 |
 |------|-----------|
-| 一直 `cmd ERROR, retry.` / `init retry exceeded` | 波特率不是 3Mbps、接线反/断、模组未上电或处于测量模式 |
+| 一直 `cmd ERROR, retry.` / `init retry exceeded` | 接线反/断、模组未上电、处于测量模式；波特率已由 `libOpenIMU_DetectBaudrate` 自动探测（日志可见 `baud detected` / `baud probe failed`），若出现 `baud detect failed` 说明所有候选波特率均无响应，先查接线/供电 |
 | 一直超时无响应 | 检查 `rxAvailable`/`read` 是否真的把数据读出来了（先开 `LIBOPENIMU_DEBUG_PRINT` 看原始 RX） |
 | 二进制帧解析乱 | 确保 `libOpenIMU_Init` 的 `uploadFormat` 与模组实际 `AT+UPLOADFORMAT` 一致（HEX 走固定帧长 52B，不走行解析） |
 | 编译报 `fullCycleUs` 非常量 | 不能在静态初始化器中赋值，改到 `Init()` 运行时填充 |
@@ -242,7 +286,7 @@ INIT(等待启动600ms)
 | `libOpenIMU/include/libopenimu.h` | 公共头/API/类型定义 |
 | `libOpenIMU/src/libopenimu.c` | 协议逻辑（纯算法） |
 | `Project/bsp/libOpenIMU_portable.c/.h` | **AT32 参考移植层** |
-| `Project/main.c`（约 939/958 行） | `libOpenIMU_Portable_Init()` 与 `libOpenIMU_Poll()` 调用点 |
+| `Project/main.c`（IMUSample_task） | `libOpenIMU_Portable_Init()` 与 `libOpenIMU_Poll()` 调用点（开机/电源时序已内置于 `libOpenIMU_Portable_Init`） |
 | `Project/bsp/uart.c/.h` | UART6 驱动（`UART6_*`） |
 | `Project/bsp/timer.c/.h`、`config.h` | `MAIN_TMR`/`MAIN_TMR_DESC` |
 | `Project/Proj/ATMC1507APP_OS.ewp` | IAR 工程（include 路径 + 源文件条目） |
