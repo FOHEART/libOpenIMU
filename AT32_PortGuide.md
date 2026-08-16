@@ -8,7 +8,7 @@
 
 - **libOpenIMU** 是 OpenIMU BNO086 模组（UART6，3Mbps）的协议驱动，用纯 C 编写，**不含任何平台相关代码**，可移植到任意 MCU/RTOS。
 - 平台能力通过函数指针结构体 **`libOpenIMU_IO`** 注入（时间、串口读写、波特率切换、电源控制等）。
-- 运行状态 `libOpenIMU_TypeDef` 实例由**移植层**持有，通过 `libOpenIMU_Init( io, inst, uploadFormat, IMU_rawType )` 传入协议逻辑（含上传格式与上传内容组合）。
+- 运行状态 `libOpenIMU_TypeDef` 实例由**移植层**持有，通过 `libOpenIMU_Init( io, inst, uploadFormat, IMU_rawType, targetBaud )` 传入协议逻辑（含上传格式、上传内容组合与目标波特率）。
 - 本工程 AT32 移植层位于 `Project/bsp/libOpenIMU_portable.c`，是移植到其它 AT32 工程的**直接参考模板**。
 
 ### 目录结构
@@ -97,7 +97,7 @@ typedef struct
 
 ```c
 /* libOpenIMU_portable.h */
-void libOpenIMU_Portable_Init( libOpenIMU_UploadFormat uploadFormat, IMU_rawType IMU_rawType );  /* 绑定 IO + 状态并调用 libOpenIMU_Init */
+void libOpenIMU_Portable_Init( libOpenIMU_UploadFormat uploadFormat, IMU_rawType IMU_rawType, libOpenIMU_BaudRate targetBaud );  /* 绑定 IO + 状态并调用 libOpenIMU_Init */
 ```
 
 ```c
@@ -149,7 +149,7 @@ static libOpenIMU_IO gLibOpenIMU_IO =
 };
 static libOpenIMU_TypeDef gLibOpenIMU;
 
-void libOpenIMU_Portable_Init( libOpenIMU_UploadFormat uploadFormat, IMU_rawType IMU_rawType )
+void libOpenIMU_Portable_Init( libOpenIMU_UploadFormat uploadFormat, IMU_rawType IMU_rawType, libOpenIMU_BaudRate targetBaud )
 {
     /* 开机流程（若需电源控制）：断电 → 100ms → 打开 UART6 → 上电 → 等待模组初始化 */
     gLibOpenIMU_IO.powerOff();
@@ -161,11 +161,11 @@ void libOpenIMU_Portable_Init( libOpenIMU_UploadFormat uploadFormat, IMU_rawType
     gLibOpenIMU_IO.delayMs( gLibOpenIMU_IO.bootInitDelayMs );
 
     gLibOpenIMU_IO.fullCycleUs = (uint32_t)MAIN_TMR_DESC.fullCycleUs;
-    libOpenIMU_Init( &gLibOpenIMU_IO, &gLibOpenIMU, uploadFormat, IMU_rawType );
+    libOpenIMU_Init( &gLibOpenIMU_IO, &gLibOpenIMU, uploadFormat, IMU_rawType, targetBaud );
 }
 ```
 
-> 💡 上传格式（`LIBOPENIMU_UPLOAD_FORMAT_STRING` / `LIBOPENIMU_UPLOAD_FORMAT_HEX`）与**上传内容组合**（`IMU_rawType` 位域）不再用编译期宏写死，而是作为 `libOpenIMU_Init` 的参数传入：同一份固件可在运行时选择字符串或二进制解析，并按需自由组合四元数/加速度/角速度/磁力计的上传内容。
+> 💡 上传格式（`LIBOPENIMU_UPLOAD_FORMAT_STRING` / `LIBOPENIMU_UPLOAD_FORMAT_HEX`）、**上传内容组合**（`IMU_rawType` 位域）与**目标波特率**（`targetBaud`）均作为 `libOpenIMU_Init` 的参数传入：同一份固件可在运行时选择字符串或二进制解析、按需组合四元数/加速度/角速度/磁力计，并可选地把模组波特率配置为目标值（参照 `ATCMD.md` §1.2）。
 
 > 💡 `setBaudrate` / `powerOn` / `powerOff` / `bootInitDelayMs` 为**可选**：`setBaudrate==NULL` 时 `libOpenIMU_Init` 跳过波特率探测（按既有波特率继续）；无电源控制需求时可将 `powerOn`/`powerOff` 置空，并在 `libOpenIMU_Portable_Init` 中去掉对应开机时序。
 
@@ -175,18 +175,19 @@ void libOpenIMU_Portable_Init( libOpenIMU_UploadFormat uploadFormat, IMU_rawType
 
 1. **上电后**（对应本工程 `main.c` 的 IMUSample_task 初始化段）调用一次：
    ```c
-   libOpenIMU_Portable_Init( LIBOPENIMU_UPLOAD_FORMAT_HEX, IMU_RAW_ALL );  /* IMU_RAW_ALL=四组全量；可传任意组合，如 IMU_RAW_QUAT | IMU_RAW_GYRO */
+   libOpenIMU_Portable_Init( LIBOPENIMU_UPLOAD_FORMAT_HEX, IMU_RAW_ALL, LIBOPENIMU_BAUD_3000000 );  /* IMU_RAW_ALL=四组全量；targetBaud 传具体值（如 LIBOPENIMU_BAUD_3000000）即把模组配置为目标波特率，传 LIBOPENIMU_BAUD_UNKNOWN 保持探测值 */
    ```
-   - 内部完成开机流程：**断电 → 等待 100ms → 打开 UART6 → 上电 → 等待模组初始化（`bootInitDelayMs`，默认 300ms）** → `fullCycleUs` 填充 → `libOpenIMU_Init( &gLibOpenIMU_IO, &gLibOpenIMU, uploadFormat, IMU_rawType )`；
-   - `libOpenIMU_Init` 会先调用 `libOpenIMU_DetectBaudrate()` 探测模组当前波特率（遍历 `libOpenIMU_BaudRate`，逐档经 `setBaudrate` 切换主机串口、发 `AT\r\n` 等待 `\r\nOK\r\n`），命中后主机串口即保持在该波特率；随后读取 `getXfpkType()` 存到 `algFilterType`、保存 `uploadFormat` 与 `IMU_rawType`，并按 `IMU_rawType` 动态生成上传格式命令/校验串与期望帧长（`libOpenIMU_BuildUploadFormat`），把状态机复位到 `LIBOPENIMU_STATE_INIT`（该状态不再延时，开机等待已由移植层 `bootInitDelayMs` 完成，进入后直接开始配置）；
+   - 内部完成开机流程：**断电 → 等待 100ms → 打开 UART6 → 上电 → 等待模组初始化（`bootInitDelayMs`，默认 300ms）** → `fullCycleUs` 填充 → `libOpenIMU_Init( &gLibOpenIMU_IO, &gLibOpenIMU, uploadFormat, IMU_rawType, targetBaud )`；
+   - `libOpenIMU_Init` 会先调用 `libOpenIMU_DetectBaudrate()` 探测模组当前波特率（遍历 `libOpenIMU_BaudRate`，逐档经 `setBaudrate` 切换主机串口、发 `AT\r\n` 等待 `\r\nOK\r\n`），命中后主机串口即保持在该波特率；随后读取 `getXfpkType()` 存到 `algFilterType`、保存 `uploadFormat`、`IMU_rawType` 与 `targetBaud`，并按 `IMU_rawType` 动态生成上传格式命令/校验串与期望帧长（`libOpenIMU_BuildUploadFormat`），把状态机复位到 `LIBOPENIMU_STATE_INIT`（该状态不再延时，开机等待已由移植层 `bootInitDelayMs` 完成，进入后先进入 config 模式、再按需配置目标波特率，然后继续配置）；
    - **开机/电源时序已内置于本函数**，`IMUSample_task` 无需再写断电/上电/开串口代码。
 
 2. **周期任务中**反复调用（本工程在 IMUSample_task 主循环）：
    ```c
    libOpenIMU_Poll();
    ```
-   - 内部是**非阻塞状态机**：开机自动完成 config 模式 → LED 关闭 → 设置滤波类型 → 设置上传格式 → 校验 → 进入 requestMeasurement 稳态；
+   - 内部是**非阻塞状态机**：开机自动完成 config 模式 → （可选）设置目标波特率 → LED 关闭 → 设置滤波类型 → 设置上传格式 → 校验 → 进入 requestMeasurement 稳态；
    - 稳态下每次 `Poll` 发送 `AT+requestFrame` 并等待 ≤3ms 解析一帧。
+   - 初始化阶段（非 MEASUREMENT）命令发送受 **100ms 最小发送间隔**（`LIBOPENIMU_CMD_SEND_INTERVAL_MS`）节流，给模组反应时间；重试/状态间不会立即连发。
    - 无需额外延时/定时器调度，直接放进你的采样循环即可。
 
 ### 3.4 读取数据
@@ -202,6 +203,34 @@ if ( libOpenIMU_GetFrame( &frame ) )
 ```
 
 - `libOpenIMU_GetFrame` 返回 `true` 表示取到最新有效帧（拷贝语义）；无有效帧返回 `false`。
+
+### 3.5 更换模块波特率（目标波特率配置）
+
+默认情况下模组波特率为 115200；`libOpenIMU` 可在初始化时把模组波特率配置为调用方指定的目标值（参考 `ATCMD.md` §1.2「修改模块波特率」）。
+
+**调用方式**：通过 `libOpenIMU_Init` / `libOpenIMU_Portable_Init` 的 `targetBaud` 参数指定：
+- 传具体枚举值（如 `LIBOPENIMU_BAUD_3000000`）→ 探测当前波特率后，把模组配置为该目标波特率；
+- 传 `LIBOPENIMU_BAUD_UNKNOWN` → 不更改波特率，保持探测值（既有行为）。
+
+**内部流程**（初始化状态机中的 `SET_BAUDRATE` 状态，位于进入 config 模式之后）：
+
+```text
+SET_CONFIG_MODE（AT+MODE=config，进入 config 模式——AT+UARTCFG 仅 config 模式有效）
+  → SET_BAUDRATE：
+      跳过条件（满足其一直接进 SET_LED_OFF）：
+        · targetBaud == LIBOPENIMU_BAUD_UNKNOWN（未指定）
+        · targetBaud == 探测到的波特率
+        · libOpenIMU_IO.setBaudrate == NULL（无主机波特率切换能力）
+      否则按子步执行（每子步等待 OK，超时重试，子步间间隔 ≥100ms）：
+        子步0：发 AT\r\n                  → 当前波特率下确认通信
+        子步1：发 AT+UARTCFG=<target>\r\n  → 模组切换波特率；随后调用 setBaudrate(目标值) 切换主机串口
+        子步2：发 AT\r\n                  → 目标波特率下验证通信 → 更新 baud → 进入 SET_LED_OFF
+```
+
+> ⚠️ **注意事项**：
+> - `AT+UARTCFG` **仅在 config 模式有效**，因此 `SET_BAUDRATE` 必须排在 `SET_CONFIG_MODE` 之后；若跳过 config 模式直接改波特率会得到 `ERROR` 并陷入重试/重初始化循环。
+> - 模组返回 `AT+UARTCFG=...` 的 `OK` 后，主机必须**立即**经 `setBaudrate` 切到同一波特率，否则后续通信失败；子步间 ≥100ms 间隔已为模组留出切换稳定时间。
+> - 若 `targetBaud == 探测值`（如模组已在目标波特率），`SET_BAUDRATE` 自动跳过，无需重配。
 
 ---
 
@@ -240,6 +269,8 @@ if ( libOpenIMU_GetFrame( &frame ) )
 | 上传格式 | `libOpenIMU_Init`/`libOpenIMU_Portable_Init` 的 `uploadFormat` 参数（`LIBOPENIMU_UPLOAD_FORMAT_STRING` / `LIBOPENIMU_UPLOAD_FORMAT_HEX`） | 字符串 CSV 或二进制 JustFloat（帧内容/长度随 `IMU_rawType` 变化）；运行时选择 |
 | 上传内容组合 | `libOpenIMU_Init`/`libOpenIMU_Portable_Init` 的 `IMU_rawType` 参数（位域：`IMU_RAW_QUAT`/`IMU_RAW_ACCEL`/`IMU_RAW_GYRO`/`IMU_RAW_MAG`，可按位或；`IMU_RAW_ALL`=全量） | 决定上传哪几组数据：上传命令串、校验串、期望 float 个数与二进制帧长均按位掩码运行时生成；未选中组在 `libOpenIMU_Frame` 中保持 0 |
 | 波特率探测 | `libOpenIMU_IO.setBaudrate`（`libopenimu.c` 的 `libOpenIMU_DetectBaudrate`） | 遍历 `libOpenIMU_BaudRate` 探测模组当前波特率；`setBaudrate==NULL` 时跳过探测，按既有波特率继续 |
+| 目标波特率 | `libOpenIMU_Init`/`libOpenIMU_Portable_Init` 的 `targetBaud` 参数（`libOpenIMU_BaudRate` 枚举） | 探测后把模组波特率配置为目标值（`SET_BAUDRATE` 状态，参照 `ATCMD.md` §1.2）；传 `LIBOPENIMU_BAUD_UNKNOWN` 或目标==探测值时跳过 |
+| 发送间隔 | `LIBOPENIMU_CMD_SEND_INTERVAL_MS`（`libopenimu.c`，默认 100） | 初始化阶段（非 MEASUREMENT）两次 AT 命令发送的最小间隔 ms，给模组反应时间，避免立即重试/连发 |
 | 开机等待延时 | `libOpenIMU_IO.bootInitDelayMs` / `LIBOPENIMU_BOOT_INIT_DELAY_MS`（`libopenimu.h`） | 上电后等待模组初始化完成（默认 300ms），`libOpenIMU_Portable_Init` 开机流程使用 |
 | 模组电源 | `libOpenIMU_IO.powerOn` / `powerOff` | 开机流程断电/上电；无电源控制需求时可置空并去掉对应时序 |
 | 滤波类型 | `getXfpkType()` 返回值 | `XFPK_Base`（游戏旋转矢量）/ `XFPK_Additional`（标准，默认）；配置阶段发 `AT+CONFIG=algFilterType,<value>` |
@@ -256,6 +287,7 @@ if ( libOpenIMU_GetFrame( &frame ) )
 波特率探测（libOpenIMU_DetectBaudrate：遍历候选 → setBaudrate → 发 AT\r\n → 等 \r\nOK\r\n）
   → INIT(直接开始配置，开机等待已由移植层 bootInitDelayMs 完成)
   → SET_CONFIG_MODE    (AT+MODE=config)
+  → SET_BAUDRATE       (可选：目标波特率配置 AT+UARTCFG；targetBaud==UNKNOWN/探测值 或 setBaudrate==NULL 时跳过)
   → SET_LED_OFF        (AT+SETLED=OFF)
   → SET_ALG_FILTER     (AT+CONFIG=algFilterType,<value>)
   → SET_UPLOADFORMAT   (AT+UPLOADFORMAT=<string|hex>,<按 IMU_rawType 动态生成的内容列表>)
@@ -265,6 +297,7 @@ if ( libOpenIMU_GetFrame( &frame ) )
 ```
 
 - 每个状态等待 `OK`，超时按重试策略重发；超过上限记录错误并重新初始化，**不阻塞任务**。
+- 非 MEASUREMENT 状态向模组发送 AT 命令受 **100ms 最小间隔**（`LIBOPENIMU_CMD_SEND_INTERVAL_MS`）节流，给模组反应时间。
 
 ---
 
@@ -273,6 +306,7 @@ if ( libOpenIMU_GetFrame( &frame ) )
 | 现象 | 原因/排查 |
 |------|-----------|
 | 一直 `cmd ERROR, retry.` / `init retry exceeded` | 接线反/断、模组未上电、处于测量模式；波特率已由 `libOpenIMU_DetectBaudrate` 自动探测（日志可见 `baud detected` / `baud probe failed`），若出现 `baud detect failed` 说明所有候选波特率均无响应，先查接线/供电 |
+| 反复出现 `target baud == detected baud, skip.` + `cmd ERROR` 循环 | 每次重初始化都卡在 `SET_BAUDRATE` 之后的 config 命令上：模组**未进入 config 模式**（`AT+UARTCFG`/`AT+SETLED` 等仅 config 模式有效，需先发 `AT+MODE=config`）。检查 `libOpenIMU_Poll` 中 `INIT` 是否先进入 `SET_CONFIG_MODE` 再进 `SET_BAUDRATE` |
 | 一直超时无响应 | 检查 `rxAvailable`/`read` 是否真的把数据读出来了（先开 `LIBOPENIMU_DEBUG_PRINT` 看原始 RX） |
 | 二进制帧解析乱 | 确保 `libOpenIMU_Init` 的 `uploadFormat` 与 `IMU_rawType` 和模组实际 `AT+UPLOADFORMAT` 一致（HEX 帧长 = 选中 float 数 × 4，随 `IMU_rawType` 动态变化，不走行解析） |
 | 某些帧字段恒为 0 | 正常：`IMU_rawType` 未选中的组不会被上传/解析，`libOpenIMU_Frame` 对应字段保持 0；如需该组数据，请把对应 bit 加入 `IMU_rawType` |

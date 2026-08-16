@@ -35,6 +35,8 @@
 #define LIBOPENIMU_MAX_RETRY (3)
 /* 稳态请求帧后最多等待 ms */
 #define LIBOPENIMU_FRAME_TIMEOUT_MS (3)
+/* 初始化阶段（非 MEASUREMENT）向模组发送 AT 命令的最小间隔 ms（给模组反应时间，避免立即重试/连发） */
+#define LIBOPENIMU_CMD_SEND_INTERVAL_MS (100)
 /* 最大期望 float 个数（全选 quat4 + accel3 + gyro3 + mag3 = 13），局部解析缓冲用；
  * 实际期望个数由 IMU_rawType 位掩码在 libOpenIMU_BuildUploadFormat 运行时生成并存入 frameFloatCount */
 #define LIBOPENIMU_FRAME_FLOAT_CNT_MAX (13)
@@ -63,6 +65,7 @@ static void libOpenIMU_RxAccumulateBytes(void);
 static bool libOpenIMU_RxReadLine(char *outLine, uint16_t outMax);
 static const char *libOpenIMU_CmdForState(libOpenIMU_State state);
 static void libOpenIMU_InitStep(void);
+static void libOpenIMU_InitStepSetBaudrate(void);
 static void libOpenIMU_BuildUploadFormat(IMU_rawType rawType, libOpenIMU_UploadFormat fmt);
 static void libOpenIMU_RequestFrame(void);
 static uint32_t libOpenIMU_TmrElapsedUs(uint32_t startUs);
@@ -94,6 +97,7 @@ static void libOpenIMU_SetState(libOpenIMU_State state)
     sLibOpenIMU->retryCount = 0;
     sLibOpenIMU->formatSeen = false;
     sLibOpenIMU->rxLen = 0;
+    sLibOpenIMU->baudStep = 0;
     sLibOpenIMU->stateStartMs = sLibOpenIMU_IO->getTickMs();
 }
 
@@ -338,9 +342,13 @@ static void libOpenIMU_InitStep(void)
     const char *cmd;
     char line[LIBOPENIMU_LINE_BUF_SIZE];
 
-    /* 首次进入该状态：发送命令 */
+    /* 首次进入该状态：发送命令（受发送间隔节流，给模组反应时间） */
     if (!sLibOpenIMU->cmdPending)
     {
+        if (sLibOpenIMU_IO->getTickMs() - sLibOpenIMU->lastCmdSendMs < LIBOPENIMU_CMD_SEND_INTERVAL_MS)
+        {
+            return; /* 未到发送间隔：等待下一轮再发 */
+        }
         cmd = libOpenIMU_CmdForState(sLibOpenIMU->state);
         if (cmd == NULL)
         {
@@ -348,6 +356,7 @@ static void libOpenIMU_InitStep(void)
             return;
         }
         libOpenIMU_SendCmd(cmd);
+        sLibOpenIMU->lastCmdSendMs = sLibOpenIMU_IO->getTickMs();
         sLibOpenIMU->cmdPending = true;
         sLibOpenIMU->stateStartMs = sLibOpenIMU_IO->getTickMs();
 #if (LIBOPENIMU_DEBUG_PRINT == 1)
@@ -402,6 +411,122 @@ static void libOpenIMU_InitStep(void)
                (unsigned long)sLibOpenIMU_IO->rxAvailable());
 #endif
         printf("[OpenIMU] cmd timeout, retry.\r\n");
+        libOpenIMU_Retry();
+    }
+}
+
+/***********************************************************
+ * Function:        libOpenIMU_InitStepSetBaudrate
+ * Description:     SET_BAUDRATE 状态处理：按 baudStep 分步把模组/主机切换到目标波特率并验证
+ * Input:
+ * Input:
+ * Output:
+ * Return:
+ * Others:          子步0=AT 确认当前波特率；子步1=AT+UARTCFG=<target> 并同步切换主机波特率；
+ *                  子步2=AT 验证目标波特率；首次进入时按跳过条件判定（UNKNOWN/目标==探测/setBaudrate==NULL）
+ ***********************************************************/
+static void libOpenIMU_InitStepSetBaudrate(void)
+{
+    char line[LIBOPENIMU_LINE_BUF_SIZE];
+
+    /* 首次进入该状态：跳过判定 */
+    if (!sLibOpenIMU->cmdPending && sLibOpenIMU->baudStep == 0)
+    {
+        if (sLibOpenIMU->targetBaud == LIBOPENIMU_BAUD_UNKNOWN)
+        {
+            /* 未指定目标波特率：保持探测值 */
+            libOpenIMU_SetState(LIBOPENIMU_STATE_SET_LED_OFF);
+            return;
+        }
+        if (sLibOpenIMU->targetBaud == sLibOpenIMU->baud)
+        {
+            printf("[OpenIMU] target baud == detected baud, skip.\r\n");
+            libOpenIMU_SetState(LIBOPENIMU_STATE_SET_LED_OFF);
+            return;
+        }
+        if (sLibOpenIMU_IO->setBaudrate == NULL)
+        {
+            printf("[OpenIMU] setBaudrate not provided, skip baud change.\r\n");
+            libOpenIMU_SetState(LIBOPENIMU_STATE_SET_LED_OFF);
+            return;
+        }
+    }
+
+    /* 首次进入当前子步：发送该子步命令（受发送间隔节流，给模组反应时间） */
+    if (!sLibOpenIMU->cmdPending)
+    {
+        char cmd[LIBOPENIMU_LINE_BUF_SIZE];
+
+        if (sLibOpenIMU_IO->getTickMs() - sLibOpenIMU->lastCmdSendMs < LIBOPENIMU_CMD_SEND_INTERVAL_MS)
+        {
+            return; /* 未到发送间隔：等待下一轮再发 */
+        }
+        if (sLibOpenIMU->baudStep == 1)
+        {
+            snprintf(cmd, sizeof(cmd), "AT+UARTCFG=%lu\r\n",
+                     (unsigned long)libOpenIMU_BaudValue[sLibOpenIMU->targetBaud]);
+        }
+        else
+        {
+            /* 子步 0 / 2：当前波特率与目标波特率下的 AT 在线确认 */
+            strcpy(cmd, LIBOPENIMU_CMD_AT);
+        }
+        libOpenIMU_SendCmd(cmd);
+        sLibOpenIMU->lastCmdSendMs = sLibOpenIMU_IO->getTickMs();
+        sLibOpenIMU->cmdPending = true;
+        sLibOpenIMU->stateStartMs = sLibOpenIMU_IO->getTickMs();
+#if (LIBOPENIMU_DEBUG_PRINT == 1)
+        printf("[OpenIMU] send len: %zu, cmd: %s", strlen(cmd), cmd);
+#endif
+    }
+
+    /* 轮询读取响应 */
+    while (libOpenIMU_RxReadLine(line, sizeof(line)))
+    {
+#if (LIBOPENIMU_DEBUG_PRINT == 1)
+        printf("[OpenIMU] line='%s'\r\n", line);
+#endif
+        if (strcmp(line, "ERROR") == 0)
+        {
+            printf("[OpenIMU] baud cmd ERROR, retry.\r\n");
+            libOpenIMU_Retry();
+            return;
+        }
+        if (strcmp(line, "OK") == 0)
+        {
+            if (sLibOpenIMU->baudStep == 0)
+            {
+                /* 当前波特率确认通过 → 进入设置波特率子步 */
+                sLibOpenIMU->baudStep = 1;
+                sLibOpenIMU->cmdPending = false;
+                sLibOpenIMU->stateStartMs = sLibOpenIMU_IO->getTickMs();
+                return;
+            }
+            if (sLibOpenIMU->baudStep == 1)
+            {
+                /* 模组已切换波特率 → 主机串口同步切换 → 进入验证子步 */
+                sLibOpenIMU_IO->setBaudrate(libOpenIMU_BaudValue[sLibOpenIMU->targetBaud]);
+                printf("[OpenIMU] host baud switched to %lu\r\n",
+                       (unsigned long)libOpenIMU_BaudValue[sLibOpenIMU->targetBaud]);
+                sLibOpenIMU->baudStep = 2;
+                sLibOpenIMU->cmdPending = false;
+                sLibOpenIMU->stateStartMs = sLibOpenIMU_IO->getTickMs();
+                return;
+            }
+            /* baudStep == 2：目标波特率验证通过 → 更新 baud 并进入下一状态 */
+            sLibOpenIMU->baud = sLibOpenIMU->targetBaud;
+            printf("[OpenIMU] baud change verified: %lu\r\n",
+                   (unsigned long)libOpenIMU_BaudValue[sLibOpenIMU->targetBaud]);
+            libOpenIMU_SetState(LIBOPENIMU_STATE_SET_LED_OFF);
+            return;
+        }
+        /* 其它行（残留响应）忽略 */
+    }
+
+    /* 超时重试 */
+    if (sLibOpenIMU_IO->getTickMs() - sLibOpenIMU->stateStartMs >= LIBOPENIMU_RESP_TIMEOUT_MS)
+    {
+        printf("[OpenIMU] baud cmd timeout, retry.\r\n");
         libOpenIMU_Retry();
     }
 }
@@ -819,7 +944,7 @@ libOpenIMU_BaudRate libOpenIMU_DetectBaudrate(void)
  * Return:
  * Others:          Other Description.
  ***********************************************************/
-void libOpenIMU_Init(libOpenIMU_IO *pIo, libOpenIMU_TypeDef *pInst, libOpenIMU_UploadFormat uploadFormat, IMU_rawType IMU_rawType)
+void libOpenIMU_Init(libOpenIMU_IO *pIo, libOpenIMU_TypeDef *pInst, libOpenIMU_UploadFormat uploadFormat, IMU_rawType IMU_rawType, libOpenIMU_BaudRate targetBaud)
 {
     sLibOpenIMU_IO = pIo;
     sLibOpenIMU = pInst;
@@ -830,6 +955,9 @@ void libOpenIMU_Init(libOpenIMU_IO *pIo, libOpenIMU_TypeDef *pInst, libOpenIMU_U
     /* 保存上传内容组合并动态生成上传格式命令/校验串/期望帧长（未选中组经 memset 保持 0） */
     sLibOpenIMU->IMU_rawType = IMU_rawType;
     libOpenIMU_BuildUploadFormat(IMU_rawType, uploadFormat);
+
+    /* 保存目标波特率（UNKNOWN=不更改，保持探测值）；SET_BAUDRATE 状态按此配置模组波特率 */
+    sLibOpenIMU->targetBaud = targetBaud;
 
     /* 先探测模组当前波特率（成功后主机串口已保持在该波特率），再进入初始化状态机 */
     sLibOpenIMU->baud = libOpenIMU_DetectBaudrate();
@@ -851,9 +979,14 @@ void libOpenIMU_Poll(void)
     switch (sLibOpenIMU->state)
     {
     case LIBOPENIMU_STATE_INIT:
-        /* 上电/启动等待已由移植层 libOpenIMU_Portable_Init（bootInitDelayMs）完成，直接进入配置阶段 */
+        /* 上电/启动等待已由移植层 libOpenIMU_Portable_Init（bootInitDelayMs）完成，先进入 config 模式
+         * （AT+UARTCFG/SETLED 等仅 config 模式有效），再进入 SET_BAUDRATE */
         libOpenIMU_DrainRx();
         libOpenIMU_SetState(LIBOPENIMU_STATE_SET_CONFIG_MODE);
+        break;
+
+    case LIBOPENIMU_STATE_SET_BAUDRATE:
+        libOpenIMU_InitStepSetBaudrate();
         break;
 
     case LIBOPENIMU_STATE_SET_CONFIG_MODE:
@@ -887,7 +1020,7 @@ bool libOpenIMU_GetFrame(libOpenIMU_Frame *pFrame)
 
 /* 打印开关：libOpenIMU_PrintFrame 中各数据组可单独控制打印（1=打印，0=不打印） */
 #define LIBOPENIMU_PRINT_QUAT (0)  /* 四元数 */
-#define LIBOPENIMU_PRINT_ACCEL (1) /* 加速度计 */
+#define LIBOPENIMU_PRINT_ACCEL (0) /* 加速度计 */
 #define LIBOPENIMU_PRINT_GYRO (0)  /* 陀螺仪 */
 #define LIBOPENIMU_PRINT_MAG (0)   /* 磁力计 */
 

@@ -77,12 +77,13 @@ typedef enum {
 typedef enum {
 	LIBOPENIMU_STATE_INIT                    = 0,  /*!< 上电/复位后初始，等待模组启动完成 */
 	LIBOPENIMU_STATE_SET_CONFIG_MODE         = 1,  /*!< 发送 AT+MODE=config，等待 OK */
-	LIBOPENIMU_STATE_SET_LED_OFF             = 2,  /*!< 发送 AT+SETLED=OFF，关闭状态 LED */
-	LIBOPENIMU_STATE_SET_ALG_FILTER          = 3,  /*!< 发送 AT+CONFIG=algFilterType,<value>，应用算法滤波类型 */
-	LIBOPENIMU_STATE_SET_UPLOADFORMAT        = 4,  /*!< 发送 AT+UPLOADFORMAT=string,quat,accel,gyro,mag，等待 OK */
-	LIBOPENIMU_STATE_VERIFY_UPLOADFORMAT     = 5,  /*!< 发送 AT+UPLOADFORMAT=?，校验上传格式生效 */
-	LIBOPENIMU_STATE_SET_REQUEST_MEASUREMENT = 6,  /*!< 发送 AT+MODE=requestMeasurement，等待 OK */
-	LIBOPENIMU_STATE_MEASUREMENT             = 7   /*!< 稳态：AT+requestFrame 逐帧请求并解析 */
+	LIBOPENIMU_STATE_SET_BAUDRATE            = 2,  /*!< 按目标波特率配置模组波特率（可选，AT+UARTCFG） */
+	LIBOPENIMU_STATE_SET_LED_OFF             = 3,  /*!< 发送 AT+SETLED=OFF，关闭状态 LED */
+	LIBOPENIMU_STATE_SET_ALG_FILTER          = 4,  /*!< 发送 AT+CONFIG=algFilterType,<value>，应用算法滤波类型 */
+	LIBOPENIMU_STATE_SET_UPLOADFORMAT        = 5,  /*!< 发送 AT+UPLOADFORMAT=string,quat,accel,gyro,mag，等待 OK */
+	LIBOPENIMU_STATE_VERIFY_UPLOADFORMAT     = 6,  /*!< 发送 AT+UPLOADFORMAT=?，校验上传格式生效 */
+	LIBOPENIMU_STATE_SET_REQUEST_MEASUREMENT = 7,  /*!< 发送 AT+MODE=requestMeasurement，等待 OK */
+	LIBOPENIMU_STATE_MEASUREMENT             = 8   /*!< 稳态：AT+requestFrame 逐帧请求并解析 */
 }libOpenIMU_State;
 
 /** @} */
@@ -133,7 +134,7 @@ typedef struct
  * @brief 上电后等待模组初始化完成的延时（ms），默认 300ms
  *        承载于 libOpenIMU_IO.bootInitDelayMs，由移植层上电流程使用
  */
-#define LIBOPENIMU_BOOT_INIT_DELAY_MS (300)
+#define LIBOPENIMU_BOOT_INIT_DELAY_MS (500)
 
 /** @def LIBOPENIMU_UPLOADFORMAT_BUF_SIZE
  * @brief 上传格式命令/校验串缓冲区大小（按全选 4 组最大长度计，64 字节足够）
@@ -161,6 +162,9 @@ typedef struct
 	uint8_t frameFloatCount;               /*!< 期望 float 个数 = Σ 选中组 float 数 */
 	uint16_t hexFrameBytes;                /*!< 二进制帧字节数 = frameFloatCount * 4 */
 	libOpenIMU_BaudRate baud;              /*!< 探测到的模组当前波特率（libOpenIMU_Init 探测确定） */
+	libOpenIMU_BaudRate targetBaud;        /*!< 目标波特率（libOpenIMU_Init 参数传入；UNKNOWN=不更改，保持探测值） */
+	uint8_t baudStep;                      /*!< SET_BAUDRATE 状态多步序列子步计数 */
+	uint32_t lastCmdSendMs;                /*!< 上一次向模组发送命令的时间 ms（非 MEASUREMENT 发送间隔节流用） */
 	libOpenIMU_Frame frame;                /*!< 最新有效帧 */
 	uint8_t rxBuf[LIBOPENIMU_RX_BUF_SIZE]; /*!< UART6 接收累积缓冲 */
 	uint16_t rxLen;                        /*!< 累积缓冲有效长度 */
@@ -175,9 +179,16 @@ typedef struct
  * @param pInst        模块运行状态实例，不能为 NULL
  * @param uploadFormat 上传格式（字符串 CSV 或二进制 JustFloat）
  * @param IMU_rawType  上传内容组合位域（四元数/加速度/角速度/磁力计自由组合；传 IMU_RAW_ALL 表示全量，与旧行为一致）
+ * @param targetBaud   目标波特率（传具体值如 LIBOPENIMU_BAUD_3000000 时，探测后把模组配置为该波特率；传 LIBOPENIMU_BAUD_UNKNOWN 表示不更改，保持探测值）
  * @note 需在调用本函数前完成底层串口（UART6）初始化
  */
-void libOpenIMU_Init( libOpenIMU_IO *pIo, libOpenIMU_TypeDef *pInst, libOpenIMU_UploadFormat uploadFormat, IMU_rawType IMU_rawType );
+void libOpenIMU_Init(
+	 libOpenIMU_IO *pIo, 
+	libOpenIMU_TypeDef *pInst, 
+	libOpenIMU_UploadFormat uploadFormat, 
+	IMU_rawType IMU_rawType, 
+	libOpenIMU_BaudRate targetBaud
+ );
 
 /**
  * @brief 探测 OpenIMU 模组当前使用的波特率
