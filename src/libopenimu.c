@@ -1,59 +1,127 @@
-/************************************************************
- * Copyright (C), 2015-2020, BEIJING FOHEART Tech. Co., Ltd.
- * FileName:
- * Author:
- * Date:
- * Description:     OpenIMU BNO086 模组（UART6）协议驱动
- * Version:
- * Function List:
- *     1. libOpenIMU_Init
- *     2. libOpenIMU_Poll
- *     3. libOpenIMU_GetFrame
- * History:
- *     <author>  <time>   <version >   <desc>
- *     MaoxiaoHu 16/01/01     1.0   build this moudle
- ***********************************************************/
+/**
+ * @file    libopenimu.c
+ * @brief   OpenIMU BNO086 module (UART6) protocol driver | OpenIMU BNO086 模组（UART6）协议驱动
+ * @details Implementation of the OpenIMU BNO086 protocol driver over UART6 | OpenIMU BNO086模组通过UART6的协议驱动实现
+ * @author  MaoxiaoHu
+ * @date    2016-01-01
+ * @version 1.0
+ * @copyright Copyright (C), 2015-2020, BEIJING FOHEART Tech. Co., Ltd.
+ *
+ * @par 修订历史
+ * <table>
+ * <tr><th>作者</th><th>时间</th><th>版本</th><th>描述</th></tr>
+ * <tr><td>MaoxiaoHu</td><td>16/01/01</td><td>1.0</td><td>build this moudle</td></tr>
+ * </table>
+ */
 
 /* Includes ------------------------------------------------------------------*/
 #include "libopenimu.h"
 
-/* AT 指令（均以 \r\n 结尾） */
+/** @name AT commands (all end with \r\n) | AT指令（均以\r\n结尾）
+ * @{
+ */
+/**
+ * @brief AT command: enter config mode | AT指令：进入配置模式
+ */
 #define LIBOPENIMU_CMD_SET_CONFIG_MODE "AT+MODE=config\r\n"
+/**
+ * @brief AT command: turn off the status LED | AT指令：关闭状态LED
+ */
 #define LIBOPENIMU_CMD_SET_LED_OFF "AT+SETLED=OFF\r\n"
+/**
+ * @brief AT command: set algorithm filter to XFPK_Base (game rotation vector) | AT指令：设置算法滤波类型为XFPK_Base（游戏旋转矢量）
+ */
 #define LIBOPENIMU_CMD_SET_ALG_FILTER_BASE "AT+CONFIG=algFilterType,XFPK_Base\r\n"
+/**
+ * @brief AT command: set algorithm filter to XFPK_Additional (standard rotation vector) | AT指令：设置算法滤波类型为XFPK_Additional（标准旋转矢量）
+ */
 #define LIBOPENIMU_CMD_SET_ALG_FILTER_ADDITIONAL "AT+CONFIG=algFilterType,XFPK_Additional\r\n"
+/**
+ * @brief AT command: query the upload format | AT指令：查询上传格式
+ */
 #define LIBOPENIMU_CMD_QUERY_UPLOADFORMAT "AT+UPLOADFORMAT=?\r\n"
+/**
+ * @brief AT command: set request-measurement mode | AT指令：设置为测量模式（requestMeasurement）
+ */
 #define LIBOPENIMU_CMD_SET_REQUEST_MEASUREMENT "AT+MODE=requestMeasurement\r\n"
+/**
+ * @brief AT command: request one data frame | AT指令：请求一帧数据
+ */
 #define LIBOPENIMU_CMD_REQUEST_FRAME "AT+requestFrame\r\n"
+/** @} */
 
 /* 上传格式（字符串/二进制）由 libOpenIMU_Init 参数传入，经 libOpenIMU_TypeDef.uploadFormat 运行时选择；
  * 上传内容命令/校验串与期望 float 个数由 IMU_rawType 在 libOpenIMU_BuildUploadFormat 运行时生成 */
 
-/* 初始化阶段每状态等待响应超时 ms */
+/** @name Timing / retry configuration | 时序与重试配置
+ * @{
+ */
+/**
+ * @brief Response timeout per state during initialization, in ms | 初始化阶段每状态等待响应超时（单位：ms）
+ * @note Valid range: positive integer; default 200 | 有效范围：正整数；默认200
+ */
 #define LIBOPENIMU_RESP_TIMEOUT_MS (200)
-/* 每状态最大重试次数 */
+/**
+ * @brief Maximum retry count per state | 每状态最大重试次数
+ * @note When exceeded, the init state machine restarts from INIT | 超过后初始化状态机从INIT重新开始
+ */
 #define LIBOPENIMU_MAX_RETRY (3)
-/* 稳态请求帧后最多等待 ms */
+/**
+ * @brief Max wait after a frame request in steady state, in ms | 稳态请求帧后最多等待时间（单位：ms）
+ * @note Default 3 | 默认3
+ */
 #define LIBOPENIMU_FRAME_TIMEOUT_MS (3)
-/* 初始化阶段（非 MEASUREMENT）向模组发送 AT 命令的最小间隔 ms（给模组反应时间，避免立即重试/连发） */
+/**
+ * @brief Min interval between AT commands to the module during init, in ms | 初始化阶段向模组发送AT命令的最小间隔（单位：ms）
+ * @details Gives the module reaction time and avoids immediate retry/back-to-back sends | 给模组反应时间，避免立即重试/连发
+ */
 #define LIBOPENIMU_CMD_SEND_INTERVAL_MS (100)
-/* 最大期望 float 个数（全选 quat4 + accel3 + gyro3 + mag3 = 13），局部解析缓冲用；
- * 实际期望个数由 IMU_rawType 位掩码在 libOpenIMU_BuildUploadFormat 运行时生成并存入 frameFloatCount */
+/**
+ * @brief Max expected float count (all groups: quat4+accel3+gyro3+mag3=13), for the local parse buffer | 最大期望float个数（全选quat4+accel3+gyro3+mag3=13），局部解析缓冲用
+ * @note The actual expected count is generated at runtime from the IMU_rawType bitmask in libOpenIMU_BuildUploadFormat and stored in frameFloatCount | 实际期望个数由IMU_rawType位掩码在libOpenIMU_BuildUploadFormat运行时生成并存入frameFloatCount
+ */
 #define LIBOPENIMU_FRAME_FLOAT_CNT_MAX (13)
-/* 调用方行缓冲大小（AT 响应/数据帧一行） */
+/**
+ * @brief Caller line buffer size (one AT response / data-frame line) | 调用方行缓冲大小（AT响应/数据帧一行）
+ */
 #define LIBOPENIMU_LINE_BUF_SIZE (128)
+/** @} */
 
-/* 调试开关：打印 UART6 收到的原始数据与响应行（定位初始化失败用） */
+/**
+ * @brief Debug switch: print raw bytes and response lines received on UART6 | 调试开关：打印UART6收到的原始数据与响应行
+ * @details Used to localize initialization failures | 用于定位初始化失败问题
+ * @note 1=enable, 0=disable | 1=使能，0=关闭
+ */
 #define LIBOPENIMU_DEBUG_PRINT (0)
 
-/* 波特率探测：候选数（不含 LIBOPENIMU_BAUD_UNKNOWN 哨兵）与每档等待响应超时 ms */
+/** @name Baudrate detection | 波特率探测
+ * @{
+ */
+/**
+ * @brief Number of baudrate candidates (excluding the LIBOPENIMU_BAUD_UNKNOWN sentinel) | 波特率探测候选数（不含LIBOPENIMU_BAUD_UNKNOWN哨兵）
+ */
 #define LIBOPENIMU_BAUD_COUNT ((int)(LIBOPENIMU_BAUD_UNKNOWN - LIBOPENIMU_BAUD_115200))
+/**
+ * @brief Response wait timeout per baudrate candidate, in ms | 波特率探测每档等待响应超时（单位：ms）
+ */
 #define LIBOPENIMU_BAUD_DETECT_TIMEOUT_MS (100)
-/* 波特率探测用的 AT 在线测试命令 */
+/**
+ * @brief AT online-test command used for baudrate detection | 波特率探测用的AT在线测试命令
+ */
 #define LIBOPENIMU_CMD_AT "AT\r\n"
+/** @} */
 
-/* 运行状态与平台 IO（实例由 libOpenIMU_portable 提供，经 libOpenIMU_Init 传入） */
+/**
+ * @brief Pointer to the module runtime-state instance | 模块运行状态实例指针
+ * @details Instance is provided by libOpenIMU_portable and passed via libOpenIMU_Init | 实例由libOpenIMU_portable提供，经libOpenIMU_Init传入
+ * @note NULL until libOpenIMU_Init() is called | 调用libOpenIMU_Init()前为NULL
+ */
 static libOpenIMU_TypeDef *sLibOpenIMU;
+/**
+ * @brief Pointer to the platform IO abstraction | 平台IO抽象指针
+ * @details Time, UART read/write and baudrate callbacks; provided by libOpenIMU_portable | 时间、串口读写与波特率回调，由libOpenIMU_portable提供
+ * @note NULL until libOpenIMU_Init() is called | 调用libOpenIMU_Init()前为NULL
+ */
 static const libOpenIMU_IO *sLibOpenIMU_IO;
 
 /* 私有函数声明 */
@@ -76,20 +144,21 @@ static float libOpenIMU_BytesToFloatLE(const uint8_t *p);
 static void libOpenIMU_ParseHexFrameData(const uint8_t *data);
 static bool libOpenIMU_TryParseHexFrame(void);
 
-/* 波特率枚举 → 数值映射表（下标与 libOpenIMU_BaudRate 枚举序一致，不含 LIBOPENIMU_BAUD_UNKNOWN） */
+/**
+ * @brief Baudrate enum → numeric value lookup table | 波特率枚举→数值映射表
+ * @details Index matches the libOpenIMU_BaudRate enum order; excludes LIBOPENIMU_BAUD_UNKNOWN | 下标与libOpenIMU_BaudRate枚举序一致，不含LIBOPENIMU_BAUD_UNKNOWN
+ * @note Units: baud; valid values: 115200..3000000 | 单位：波特；有效范围：115200..3000000
+ */
 static const uint32_t libOpenIMU_BaudValue[LIBOPENIMU_BAUD_COUNT] = {
     115200, 230400, 256000, 460800, 921600,
     1000000, 1500000, 2000000, 3000000};
 
-/***********************************************************
- * Function:        libOpenIMU_SetState
- * Description:     切换状态并重置该状态相关字段
- * Input:
- * Input:
- * Output:
- * Return:
- * Others:          Other Description.
- ***********************************************************/
+/**
+ * @brief Switch state and reset state-related fields | 切换状态并重置该状态相关字段
+ * @param state New state to enter | 要进入的新状态
+ * @return void
+ * @note Resets cmdPending/retryCount/formatSeen/rxLen/baudStep and records stateStartMs | 重置cmdPending/retryCount/formatSeen/rxLen/baudStep并记录stateStartMs
+ */
 static void libOpenIMU_SetState(libOpenIMU_State state)
 {
     sLibOpenIMU->state = state;
@@ -101,15 +170,12 @@ static void libOpenIMU_SetState(libOpenIMU_State state)
     sLibOpenIMU->stateStartMs = sLibOpenIMU_IO->getTickMs();
 }
 
-/***********************************************************
- * Function:        libOpenIMU_Retry
- * Description:     当前状态超时/失败处理：重发命令或重新初始化
- * Input:
- * Input:
- * Output:
- * Return:
- * Others:          Other Description.
- ***********************************************************/
+/**
+ * @brief Current-state timeout/failure handling | 当前状态超时/失败处理
+ * @details Retries by resending the command, or re-initializes when the retry limit is reached | 重发命令重试，达到重试上限时重新初始化
+ * @return void
+ * @note On reaching LIBOPENIMU_MAX_RETRY it drains RX and restarts from the INIT state | 达到LIBOPENIMU_MAX_RETRY时清空RX并从INIT状态重新开始
+ */
 static void libOpenIMU_Retry(void)
 {
     sLibOpenIMU->retryCount++;
@@ -128,15 +194,12 @@ static void libOpenIMU_Retry(void)
     }
 }
 
-/***********************************************************
- * Function:        libOpenIMU_DrainRx
- * Description:     丢弃 UART6 RX 中残留数据（如模组启动消息）
- * Input:
- * Input:
- * Output:
- * Return:
- * Others:          Other Description.
- ***********************************************************/
+/**
+ * @brief Discard residual data in the UART6 RX | 丢弃UART6 RX中残留数据
+ * @details Drains all pending bytes, e.g. module startup messages | 清空所有待读字节（如模组启动消息）
+ * @return void
+ * @note Resets rxLen to 0 after draining | 清空后rxLen复位为0
+ */
 static void libOpenIMU_DrainRx(void)
 {
     uint8_t tmp[16];
@@ -149,29 +212,24 @@ static void libOpenIMU_DrainRx(void)
     sLibOpenIMU->rxLen = 0;
 }
 
-/***********************************************************
- * Function:        libOpenIMU_SendCmd
- * Description:     通过 UART6 发送一条 AT 指令
- * Input:
- * Input:
- * Output:
- * Return:
- * Others:          Other Description.
- ***********************************************************/
+/**
+ * @brief Send an AT command over UART6 | 通过UART6发送一条AT指令
+ * @param cmd Null-terminated AT command string | 以'\0'结尾的AT指令字符串
+ * @return void
+ */
 static void libOpenIMU_SendCmd(const char *cmd)
 {
     sLibOpenIMU_IO->write((const uint8_t *)cmd, strlen(cmd));
 }
 
-/***********************************************************
- * Function:        libOpenIMU_DebugDumpHex
- * Description:     调试：以十六进制+可读字符打印收到的原始字节
- * Input:
- * Input:
- * Output:
- * Return:
- * Others:          Other Description.
- ***********************************************************/
+/**
+ * @brief Debug: print received raw bytes as hex + printable chars | 调试：以十六进制+可读字符打印收到的原始字节
+ * @param tag Tag prefix for the log line | 日志行的标签前缀
+ * @param buf Pointer to the raw byte buffer | 原始字节缓冲区指针
+ * @param len Number of bytes to print | 要打印的字节数
+ * @return void
+ * @note Only active when LIBOPENIMU_DEBUG_PRINT == 1 | 仅当LIBOPENIMU_DEBUG_PRINT == 1时生效
+ */
 static void libOpenIMU_DebugDumpHex(const char *tag, const uint8_t *buf, uint32_t len)
 {
     printf("[OpenIMU][%s] len=%lu:", tag, (unsigned long)len);
@@ -203,24 +261,12 @@ static void libOpenIMU_DebugDumpHex(const char *tag, const uint8_t *buf, uint32_
     printf("\r\n");
 }
 
-/***********************************************************
- * Function:        libOpenIMU_RxReadLine
- * Description:     读取 UART6 RX 到行缓冲，取出一行（以 \n 结尾，容忍前导 CRLF 与分片）
- * Input:
- * Input:
- * Output:
- * Return:          true=已得到一行（outLine 不含换行符）
- * Others:          Other Description.
- ***********************************************************/
-/***********************************************************
- * Function:        libOpenIMU_RxAccumulateBytes
- * Description:     把 UART6 RX 中所有数据搬入内部累积缓冲（保留未成行/未成帧数据）
- * Input:
- * Input:
- * Output:
- * Return:
- * Others:          Other Description.
- ***********************************************************/
+/**
+ * @brief Move all UART6 RX bytes into the internal accumulation buffer | 把UART6 RX中所有数据搬入内部累积缓冲
+ * @details Preserves data that has not yet formed a complete line/frame | 保留未成行/未成帧的数据
+ * @return void
+ * @note When the buffer is full, the oldest byte is discarded to make room | 缓冲满时丢弃最早一个字节腾出空间
+ */
 static void libOpenIMU_RxAccumulateBytes(void)
 {
     uint8_t tmp[16];
@@ -248,15 +294,14 @@ static void libOpenIMU_RxAccumulateBytes(void)
     }
 }
 
-/***********************************************************
- * Function:        libOpenIMU_RxReadLine
- * Description:     读取 UART6 RX 到行缓冲，取出一行（以 \n 结尾，容忍前导 CRLF 与分片）
- * Input:
- * Input:
- * Output:
- * Return:          true=已得到一行（outLine 不含换行符）
- * Others:          Other Description.
- ***********************************************************/
+/**
+ * @brief Read UART6 RX into the line buffer and extract one line | 读取UART6 RX到行缓冲，取出一行
+ * @details Lines end with '\n'; tolerates leading CRLF and fragmented arrival | 以'\n'结尾的行，容忍前导CRLF与分片
+ * @param outLine Output buffer for the extracted line | 输出行缓冲区
+ * @param outMax Size of the output buffer | 输出缓冲区大小
+ * @return true = one line obtained (outLine contains no newline); false = no complete line yet | true=已得到一行（outLine不含换行符）；false=暂无完整行
+ * @note The consumed line (including '\n') is removed from the accumulation buffer | 已消费的一行（含'\n'）会从累积缓冲中移除
+ */
 static bool libOpenIMU_RxReadLine(char *outLine, uint16_t outMax)
 {
     uint16_t lineEnd;
@@ -294,15 +339,12 @@ static bool libOpenIMU_RxReadLine(char *outLine, uint16_t outMax)
     return false;
 }
 
-/***********************************************************
- * Function:        libOpenIMU_CmdForState
- * Description:     返回当前状态应发送的 AT 指令
- * Input:
- * Input:
- * Output:
- * Return:
- * Others:          Other Description.
- ***********************************************************/
+/**
+ * @brief Return the AT command to send for the current state | 返回当前状态应发送的AT指令
+ * @param state Current initialization state | 当前初始化状态
+ * @return Command string, or NULL for states with no command | 指令字符串；无指令的状态返回NULL
+ * @note SET_ALG_FILTER/SET_UPLOADFORMAT commands depend on the runtime-configured algFilterType/uploadFormat | SET_ALG_FILTER/SET_UPLOADFORMAT指令取决于运行时配置的algFilterType/uploadFormat
+ */
 static const char *libOpenIMU_CmdForState(libOpenIMU_State state)
 {
     switch (state)
@@ -328,15 +370,12 @@ static const char *libOpenIMU_CmdForState(libOpenIMU_State state)
     }
 }
 
-/***********************************************************
- * Function:        libOpenIMU_InitStep
- * Description:     初始化状态机单步推进：发送命令→等待响应（超时重试）
- * Input:
- * Input:
- * Output:
- * Return:
- * Others:          Other Description.
- ***********************************************************/
+/**
+ * @brief Single-step advance of the init state machine | 初始化状态机单步推进
+ * @details Sends the state command, then waits for the response with timeout/retry | 发送状态命令，然后等待响应（超时重试）
+ * @return void
+ * @note Command sending is throttled by LIBOPENIMU_CMD_SEND_INTERVAL_MS | 命令发送受LIBOPENIMU_CMD_SEND_INTERVAL_MS间隔节流
+ */
 static void libOpenIMU_InitStep(void)
 {
     const char *cmd;
@@ -415,16 +454,13 @@ static void libOpenIMU_InitStep(void)
     }
 }
 
-/***********************************************************
- * Function:        libOpenIMU_InitStepSetBaudrate
- * Description:     SET_BAUDRATE 状态处理：按 baudStep 分步把模组/主机切换到目标波特率并验证
- * Input:
- * Input:
- * Output:
- * Return:
- * Others:          子步0=AT 确认当前波特率；子步1=AT+UARTCFG=<target> 并同步切换主机波特率；
- *                  子步2=AT 验证目标波特率；首次进入时按跳过条件判定（UNKNOWN/目标==探测/setBaudrate==NULL）
- ***********************************************************/
+/**
+ * @brief SET_BAUDRATE state handling | SET_BAUDRATE状态处理
+ * @details Switches the module/host to the target baudrate in baudStep sub-steps and verifies it | 按baudStep子步将模组/主机切换到目标波特率并验证
+ * @return void
+ * @note Sub-step 0 = AT confirms current baud; sub-step 1 = AT+UARTCFG=<target> plus host baud switch;
+ *       sub-step 2 = AT verifies target baud. Skip conditions: UNKNOWN target, target == detected, or setBaudrate == NULL | 子步0=AT确认当前波特率；子步1=AT+UARTCFG=<target>并同步切换主机波特率；子步2=AT验证目标波特率。跳过条件：目标为UNKNOWN、目标==探测值或setBaudrate==NULL
+ */
 static void libOpenIMU_InitStepSetBaudrate(void)
 {
     char line[LIBOPENIMU_LINE_BUF_SIZE];
@@ -531,16 +567,14 @@ static void libOpenIMU_InitStepSetBaudrate(void)
     }
 }
 
-/***********************************************************
- * Function:        libOpenIMU_BuildUploadFormat
- * Description:     按 IMU_rawType 位掩码动态生成上传格式命令、校验串与期望帧长并存入实例
- * Input:
- * Input:
- * Output:
- * Return:
- * Others:          按固定顺序 quat→accel→gyro→mag 生成数据组列表（与模组输出顺序一致）；
- *                  空组合（0）回退为全选，避免发送非法空列表命令
- ***********************************************************/
+/**
+ * @brief Dynamically build the upload-format command, expected string and frame length | 按IMU_rawType位掩码动态生成上传格式命令、校验串与期望帧长
+ * @param rawType Selected data-group bitmask | 选中的数据组位掩码
+ * @param fmt Upload format (string or hex) | 上传格式（字符串或十六进制）
+ * @return void
+ * @note Builds the data-group list in fixed order quat→accel→gyro→mag (matches module output order).
+ *       An empty combination (0) falls back to all groups to avoid an illegal empty list command | 按固定顺序quat→accel→gyro→mag生成数据组列表（与模组输出顺序一致）；空组合（0）回退为全选
+ */
 static void libOpenIMU_BuildUploadFormat(IMU_rawType rawType, libOpenIMU_UploadFormat fmt)
 {
     char list[LIBOPENIMU_UPLOADFORMAT_BUF_SIZE];
@@ -601,15 +635,12 @@ static void libOpenIMU_BuildUploadFormat(IMU_rawType rawType, libOpenIMU_UploadF
     sLibOpenIMU->hexFrameBytes = (uint16_t)((uint32_t)floatCount * (uint32_t)sizeof(float));
 }
 
-/***********************************************************
- * Function:        libOpenIMU_TmrElapsedUs
- * Description:     微秒计数器（1MHz，经 libOpenIMU_IO.getUs 获取）自 startUs 起经过的 us（含回绕）
- * Input:
- * Input:
- * Output:
- * Return:
- * Others:          Other Description.
- ***********************************************************/
+/**
+ * @brief Microsecond-counter elapsed since startUs, wrap-safe | 微秒计数器自startUs起经过的us（含回绕）
+ * @details Uses the free-running us counter from libOpenIMU_IO.getUs | 使用libOpenIMU_IO.getUs获取的自由运行微秒计数器
+ * @param startUs Start timestamp in us | 起始时间戳（微秒）
+ * @return Elapsed microseconds, accounting for wraparound | 经过的微秒数（已处理回绕）
+ */
 static uint32_t libOpenIMU_TmrElapsedUs(uint32_t startUs)
 {
     uint32_t nowUs = sLibOpenIMU_IO->getUs();
@@ -623,15 +654,13 @@ static uint32_t libOpenIMU_TmrElapsedUs(uint32_t startUs)
 }
 
 /* === 字符串（STRING）格式解析 === */
-/***********************************************************
- * Function:        libOpenIMU_ParseFrame
- * Description:     解析一行字符串帧（13 个逗号分隔浮点数）到 libOpenIMU_Frame
- * Input:
- * Input:
- * Output:
- * Return:          true=解析成功并更新最新有效帧
- * Others:          Other Description.
- ***********************************************************/
+/**
+ * @brief Parse one line of a string-format frame into libOpenIMU_Frame | 解析一行字符串帧到libOpenIMU_Frame
+ * @details Parses the comma-separated floats (count = frameFloatCount) | 解析逗号分隔浮点数（个数=frameFloatCount）
+ * @param line Pointer to the frame line | 帧行字符串指针
+ * @return true = parsed OK and the latest valid frame was updated; false = parse failed | true=解析成功并更新最新有效帧；false=解析失败
+ * @note Only the groups selected in IMU_rawType are filled; unselected groups stay 0 | 仅填充IMU_rawType选中的组，未选中组保持0
+ */
 static bool libOpenIMU_ParseFrame(const char *line)
 {
     float values[LIBOPENIMU_FRAME_FLOAT_CNT_MAX];
@@ -703,15 +732,11 @@ static bool libOpenIMU_ParseFrame(const char *line)
     return true;
 }
 
-/***********************************************************
- * Function:        libOpenIMU_TryParseFrame
- * Description:     读取完整行并尝试解析为数据帧
- * Input:
- * Input:
- * Output:
- * Return:          true=已解析到一帧有效数据
- * Others:          Other Description.
- ***********************************************************/
+/**
+ * @brief Read complete lines and try to parse a data frame | 读取完整行并尝试解析为数据帧
+ * @return true = one valid frame was parsed; false = no valid frame yet | true=已解析到一帧有效数据；false=暂无有效帧
+ * @note Invalid lines (e.g. residual OK) are ignored and reading continues | 无效行（如残留OK）被忽略并继续读取
+ */
 static bool libOpenIMU_TryParseFrame(void)
 {
     char line[LIBOPENIMU_LINE_BUF_SIZE];
@@ -729,15 +754,12 @@ static bool libOpenIMU_TryParseFrame(void)
 }
 /* === 二进制（HEX）格式解析 === */
 
-/***********************************************************
- * Function:        libOpenIMU_BytesToFloatLE
- * Description:     按小端序将 4 字节转换为 float（跨平台安全，不依赖主机字节序）
- * Input:
- * Input:
- * Output:
- * Return:
- * Others:          Other Description.
- ***********************************************************/
+/**
+ * @brief Convert 4 bytes to float in little-endian order | 按小端序将4字节转换为float
+ * @details Byte-order safe and independent of the host endianness | 跨平台安全，不依赖主机字节序
+ * @param p Pointer to 4 bytes of little-endian float data | 4字节小端float数据指针
+ * @return The converted float value | 转换后的float值
+ */
 static float libOpenIMU_BytesToFloatLE(const uint8_t *p)
 {
     float f;
@@ -750,15 +772,13 @@ static float libOpenIMU_BytesToFloatLE(const uint8_t *p)
     return f;
 }
 
-/***********************************************************
- * Function:        libOpenIMU_ParseHexFrameData
- * Description:     解析二进制格式帧数据（仅含 IMU_rawType 选中组的 little-endian float，无帧尾）
- * Input:
- * Input:
- * Output:
- * Return:
- * Others:          顺序 quat(4) → accel(3) → gyro(3) → mag(3)
- ***********************************************************/
+/**
+ * @brief Parse binary-format frame data | 解析二进制格式帧数据
+ * @details Contains only little-endian floats of the IMU_rawType-selected groups, no trailer | 仅含IMU_rawType选中组的小端float，无帧尾
+ * @param data Pointer to the raw frame bytes | 原始帧数据指针
+ * @return void
+ * @note Order: quat(4) → accel(3) → gyro(3) → mag(3) | 顺序：quat(4) → accel(3) → gyro(3) → mag(3)
+ */
 static void libOpenIMU_ParseHexFrameData(const uint8_t *data)
 {
     uint32_t off = 0;
@@ -808,15 +828,12 @@ static void libOpenIMU_ParseHexFrameData(const uint8_t *data)
     sLibOpenIMU->frameValid = true;
 }
 
-/***********************************************************
- * Function:        libOpenIMU_TryParseHexFrame
- * Description:     接收并解析一帧二进制格式数据（帧长按 IMU_rawType 动态，无帧尾标记）
- * Input:
- * Input:
- * Output:
- * Return:          true=已解析到一帧有效数据
- * Others:          二进制数据可能含 0x0A，不能走行解析，必须按动态帧长定帧
- ***********************************************************/
+/**
+ * @brief Receive and parse one binary-format frame | 接收并解析一帧二进制格式数据
+ * @details Frame length is dynamic per IMU_rawType (hexFrameBytes), no trailer marker | 帧长按IMU_rawType动态（hexFrameBytes），无帧尾标记
+ * @return true = one valid frame was parsed; false = frame not yet complete | true=已解析到一帧有效数据；false=暂未收满一帧
+ * @note Binary data may contain 0x0A, so line parsing cannot be used; framing must be by dynamic length | 二进制数据可能含0x0A，不能走行解析，必须按动态帧长定帧
+ */
 static bool libOpenIMU_TryParseHexFrame(void)
 {
     /* 帧长按 IMU_rawType 动态生成（hexFrameBytes = 选中 float 个数 × 4，无帧头/帧尾） */
@@ -837,15 +854,11 @@ static bool libOpenIMU_TryParseHexFrame(void)
     return false;
 }
 
-/***********************************************************
- * Function:        libOpenIMU_RequestFrame
- * Description:     稳态：发送 AT+requestFrame 并在 ≤3ms 内等待并解析一帧
- * Input:
- * Input:
- * Output:
- * Return:
- * Others:          Other Description.
- ***********************************************************/
+/**
+ * @brief Steady state: send AT+requestFrame and wait ≤3ms for one frame | 稳态：发送AT+requestFrame并在≤3ms内等待并解析一帧
+ * @return void
+ * @note Wait window is LIBOPENIMU_FRAME_TIMEOUT_MS | 等待窗口为LIBOPENIMU_FRAME_TIMEOUT_MS
+ */
 static void libOpenIMU_RequestFrame(void)
 {
     uint32_t startUs;
@@ -872,16 +885,12 @@ static void libOpenIMU_RequestFrame(void)
     } while (libOpenIMU_TmrElapsedUs(startUs) < (LIBOPENIMU_FRAME_TIMEOUT_MS * 1000));
 }
 
-/***********************************************************
- * Function:        libOpenIMU_DetectBaudrate
- * Description:     探测 OpenIMU 模组当前使用的波特率：遍历支持的波特率，
- *                  逐档切换主机串口、发送 AT\r\n 并等待 \r\nOK\r\n 响应
- * Input:
- * Input:
- * Output:
- * Return:          命中返回对应 libOpenIMU_BaudRate；全部未命中返回 LIBOPENIMU_BAUD_UNKNOWN
- * Others:          命中后主机串口即保持在探测到的波特率上，无需再次切换
- ***********************************************************/
+/**
+ * @brief Detect the baudrate currently used by the OpenIMU module | 探测OpenIMU模组当前使用的波特率
+ * @details Iterates all supported baudrates: switches the host UART, sends AT\r\n, waits for \r\nOK\r\n | 遍历支持的波特率：逐档切换主机串口、发送AT\r\n并等待\r\nOK\r\n响应
+ * @return Matching libOpenIMU_BaudRate on hit, or LIBOPENIMU_BAUD_UNKNOWN if none match | 命中返回对应libOpenIMU_BaudRate；全部未命中返回LIBOPENIMU_BAUD_UNKNOWN
+ * @note On a hit the host UART stays at the detected baudrate, no further switch needed | 命中后主机串口即保持在探测到的波特率上，无需再次切换
+ */
 libOpenIMU_BaudRate libOpenIMU_DetectBaudrate(void)
 {
     uint32_t i;
@@ -935,15 +944,17 @@ libOpenIMU_BaudRate libOpenIMU_DetectBaudrate(void)
     return LIBOPENIMU_BAUD_UNKNOWN;
 }
 
-/***********************************************************
- * Function:        libOpenIMU_Init
- * Description:     初始化模块并复位状态机到 INIT（先探测波特率）
- * Input:
- * Input:
- * Output:
- * Return:
- * Others:          Other Description.
- ***********************************************************/
+/**
+ * @brief Initialize the module and reset the state machine to INIT | 初始化模块并复位状态机到INIT
+ * @details Detects the baudrate first, then enters the initialization state machine | 先探测波特率，再进入初始化状态机
+ * @param pIo Platform IO abstraction (time, UART read/write) | 平台IO抽象（时间与串口读写回调）
+ * @param pInst Module state instance to operate on | 模块运行状态实例
+ * @param uploadFormat Upload format (string or hex) | 上传格式（字符串或十六进制）
+ * @param IMU_rawType Selected data-group bitmask | 上传内容组合位域
+ * @param targetBaud Target baudrate; LIBOPENIMU_BAUD_UNKNOWN keeps the detected value | 目标波特率；LIBOPENIMU_BAUD_UNKNOWN表示保持探测值
+ * @return void
+ * @note Requires the underlying UART6 to be initialized before calling | 调用前需完成底层串口（UART6）初始化
+ */
 void libOpenIMU_Init(libOpenIMU_IO *pIo, libOpenIMU_TypeDef *pInst, libOpenIMU_UploadFormat uploadFormat, IMU_rawType IMU_rawType, libOpenIMU_BaudRate targetBaud)
 {
     sLibOpenIMU_IO = pIo;
@@ -965,15 +976,11 @@ void libOpenIMU_Init(libOpenIMU_IO *pIo, libOpenIMU_TypeDef *pInst, libOpenIMU_U
     libOpenIMU_SetState(LIBOPENIMU_STATE_INIT);
 }
 
-/***********************************************************
- * Function:        libOpenIMU_Poll
- * Description:     状态机推进（由 IMUSample_task 每轮调用）
- * Input:
- * Input:
- * Output:
- * Return:
- * Others:          Other Description.
- ***********************************************************/
+/**
+ * @brief State machine advance, called every loop by IMUSample_task | 状态机推进（由IMUSample_task每轮调用）
+ * @return void
+ * @note Must be called periodically | 需周期性调用
+ */
 void libOpenIMU_Poll(void)
 {
     switch (sLibOpenIMU->state)
@@ -1008,6 +1015,12 @@ void libOpenIMU_Poll(void)
     }
 }
 
+/**
+ * @brief Get the latest valid frame data | 获取最新有效帧数据
+ * @param pFrame Output buffer for the frame; must not be NULL | 输出帧数据缓冲区，不能为NULL
+ * @return true = one valid frame was copied; false = no valid frame available or bad pointer | true=已成功获取一帧有效数据；false=暂无有效帧或指针无效
+ * @note The returned frame is a copy of the internal latest frame | 返回的帧为内部最新帧的拷贝
+ */
 bool libOpenIMU_GetFrame(libOpenIMU_Frame *pFrame)
 {
     if (pFrame == NULL || !sLibOpenIMU->frameValid)
@@ -1018,12 +1031,33 @@ bool libOpenIMU_GetFrame(libOpenIMU_Frame *pFrame)
     return true;
 }
 
-/* 打印开关：libOpenIMU_PrintFrame 中各数据组可单独控制打印（1=打印，0=不打印） */
-#define LIBOPENIMU_PRINT_QUAT (0)  /* 四元数 */
-#define LIBOPENIMU_PRINT_ACCEL (0) /* 加速度计 */
-#define LIBOPENIMU_PRINT_GYRO (0)  /* 陀螺仪 */
-#define LIBOPENIMU_PRINT_MAG (0)   /* 磁力计 */
+/** @name Print switches
+ * @brief Print toggles for libOpenIMU_PrintFrame data groups (1=print, 0=off) | libOpenIMU_PrintFrame中各数据组打印开关（1=打印，0=不打印）
+ * @{
+ */
+/**
+ * @brief Print quaternion (w,x,y,z) | 打印四元数（w,x,y,z）
+ */
+#define LIBOPENIMU_PRINT_QUAT (0)
+/**
+ * @brief Print accelerometer (x,y,z in g) | 打印加速度计（x,y,z，单位g）
+ */
+#define LIBOPENIMU_PRINT_ACCEL (0)
+/**
+ * @brief Print gyroscope (x,y,z in dps) | 打印陀螺仪（x,y,z，单位°/s）
+ */
+#define LIBOPENIMU_PRINT_GYRO (0)
+/**
+ * @brief Print magnetometer (x,y,z in µT) | 打印磁力计（x,y,z，单位µT）
+ */
+#define LIBOPENIMU_PRINT_MAG (0)
+/** @} */
 
+/**
+ * @brief Print the latest valid frame data (debug) | 打印最新有效帧数据（调试用）
+ * @return void
+ * @note Each data group's printing is independently controlled by the LIBOPENIMU_PRINT_* switches | 各组打印由LIBOPENIMU_PRINT_*开关分别控制
+ */
 void libOpenIMU_PrintFrame(void)
 {
     libOpenIMU_Frame *pFrame = &sLibOpenIMU->frame;
