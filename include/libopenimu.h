@@ -44,9 +44,20 @@ typedef enum {
 
 /** @brief OpenIMU 上传格式（经 libOpenIMU_Init 参数指定，替代编译期宏） */
 typedef enum {
-	LIBOPENIMU_UPLOAD_FORMAT_STRING = 0,  /**< 字符串（13 浮点 CSV） */
-	LIBOPENIMU_UPLOAD_FORMAT_HEX = 1      /**< 二进制 JustFloat（固定帧长） */
+	LIBOPENIMU_UPLOAD_FORMAT_STRING = 0,  /**< 字符串（CSV，float 个数随 IMU_rawType 变化） */
+	LIBOPENIMU_UPLOAD_FORMAT_HEX = 1      /**< 二进制 JustFloat（帧长随 IMU_rawType 变化） */
 }libOpenIMU_UploadFormat;
+
+/** @brief OpenIMU 上传内容位域（按 bit 自由组合，经 libOpenIMU_Init 参数指定）
+ * 位掩码决定上传哪几组数据：四元数/加速度/角速度/磁力计，可任意按位或组合
+ */
+typedef enum IMU_rawType_e {
+	IMU_RAW_QUAT  = ( 1 << 0 ),  /**< 四元数（4 个 float） */
+	IMU_RAW_ACCEL = ( 1 << 1 ),  /**< 加速度计（3 个 float） */
+	IMU_RAW_GYRO  = ( 1 << 2 ),  /**< 陀螺仪（3 个 float） */
+	IMU_RAW_MAG   = ( 1 << 3 ),  /**< 磁力计（3 个 float） */
+	IMU_RAW_ALL   = ( IMU_RAW_QUAT | IMU_RAW_ACCEL | IMU_RAW_GYRO | IMU_RAW_MAG )  /**< 全选（默认，与既有全量行为一致） */
+}IMU_rawType;
 
 /** @brief OpenIMU 模组支持的 UART 波特率（与 AT+UARTCFG 取值一致） */
 typedef enum {
@@ -124,6 +135,11 @@ typedef struct
  */
 #define LIBOPENIMU_BOOT_INIT_DELAY_MS (300)
 
+/** @def LIBOPENIMU_UPLOADFORMAT_BUF_SIZE
+ * @brief 上传格式命令/校验串缓冲区大小（按全选 4 组最大长度计，64 字节足够）
+ */
+#define LIBOPENIMU_UPLOADFORMAT_BUF_SIZE (64)
+
 /** @brief OpenIMU 模块运行状态
  * 由 portable 层实例化，指针传入 libOpenIMU_Init
  */
@@ -138,6 +154,12 @@ typedef struct
 	bool frameValid;                       /*!< 最新帧是否有效 */
 	XFPK_Type algFilterType;               /*!< 算法滤波类型（配置阶段应用） */
 	libOpenIMU_UploadFormat uploadFormat;  /*!< 上传格式（libOpenIMU_Init 参数传入） */
+	IMU_rawType IMU_rawType;               /*!< 上传内容组合位域（libOpenIMU_Init 参数传入） */
+	char uploadFormatCmdStr[LIBOPENIMU_UPLOADFORMAT_BUF_SIZE];   /*!< 动态生成 AT+UPLOADFORMAT=string,<list>\r\n */
+	char uploadFormatCmdHex[LIBOPENIMU_UPLOADFORMAT_BUF_SIZE];   /*!< 动态生成 AT+UPLOADFORMAT=hex,<list>\r\n */
+	char expectedUploadFormat[LIBOPENIMU_UPLOADFORMAT_BUF_SIZE]; /*!< 动态生成期望校验串 <fmt>,<list> */
+	uint8_t frameFloatCount;               /*!< 期望 float 个数 = Σ 选中组 float 数 */
+	uint16_t hexFrameBytes;                /*!< 二进制帧字节数 = frameFloatCount * 4 */
 	libOpenIMU_BaudRate baud;              /*!< 探测到的模组当前波特率（libOpenIMU_Init 探测确定） */
 	libOpenIMU_Frame frame;                /*!< 最新有效帧 */
 	uint8_t rxBuf[LIBOPENIMU_RX_BUF_SIZE]; /*!< UART6 接收累积缓冲 */
@@ -152,9 +174,10 @@ typedef struct
  * @param pIo          平台 IO 抽象（时间与串口读写回调），不能为 NULL
  * @param pInst        模块运行状态实例，不能为 NULL
  * @param uploadFormat 上传格式（字符串 CSV 或二进制 JustFloat）
+ * @param IMU_rawType  上传内容组合位域（四元数/加速度/角速度/磁力计自由组合；传 IMU_RAW_ALL 表示全量，与旧行为一致）
  * @note 需在调用本函数前完成底层串口（UART6）初始化
  */
-void libOpenIMU_Init( libOpenIMU_IO *pIo, libOpenIMU_TypeDef *pInst, libOpenIMU_UploadFormat uploadFormat );
+void libOpenIMU_Init( libOpenIMU_IO *pIo, libOpenIMU_TypeDef *pInst, libOpenIMU_UploadFormat uploadFormat, IMU_rawType IMU_rawType );
 
 /**
  * @brief 探测 OpenIMU 模组当前使用的波特率
