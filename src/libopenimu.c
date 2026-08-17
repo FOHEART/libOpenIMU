@@ -1023,6 +1023,7 @@ bool libOpenIMU_GetFrame(libOpenIMU_Frame *pFrame)
 #define LIBOPENIMU_PRINT_ACCEL (0) /* 加速度计 */
 #define LIBOPENIMU_PRINT_GYRO (0)  /* 陀螺仪 */
 #define LIBOPENIMU_PRINT_MAG (0)   /* 磁力计 */
+#define LIBOPENIMU_ATLEAST_ONE_PRINT (LIBOPENIMU_PRINT_QUAT || LIBOPENIMU_PRINT_ACCEL || LIBOPENIMU_PRINT_GYRO || LIBOPENIMU_PRINT_MAG)
 
 void libOpenIMU_PrintFrame(void)
 {
@@ -1034,7 +1035,7 @@ void libOpenIMU_PrintFrame(void)
         return;
     }
 
-#if LIBOPENIMU_PRINT_QUAT || LIBOPENIMU_PRINT_ACCEL || LIBOPENIMU_PRINT_GYRO || LIBOPENIMU_PRINT_MAG
+#if LIBOPENIMU_ATLEAST_ONE_PRINT
     printf("[OpenIMU] t=%lu", (unsigned long)pFrame->timestampMs);
 #endif
 
@@ -1054,6 +1055,8 @@ void libOpenIMU_PrintFrame(void)
     printf(" mag(uT)=%.3f,%.3f,%.3f",
            pFrame->mag_uT[0], pFrame->mag_uT[1], pFrame->mag_uT[2]);
 #endif
+#if LIBOPENIMU_ATLEAST_ONE_PRINT
 
     printf("\r\n");
+    #endif
 }
