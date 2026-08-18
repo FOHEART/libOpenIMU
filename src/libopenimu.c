@@ -1051,6 +1051,8 @@ bool libOpenIMU_GetFrame(libOpenIMU_Frame *pFrame)
  * @brief Print magnetometer (x,y,z in µT) | 打印磁力计（x,y,z，单位µT）
  */
 #define LIBOPENIMU_PRINT_MAG (0)
+
+#define LIBOPENIMU_ATLEAST_ONE_PRINT (LIBOPENIMU_PRINT_QUAT || LIBOPENIMU_PRINT_ACCEL || LIBOPENIMU_PRINT_GYRO || LIBOPENIMU_PRINT_MAG)
 /** @} */
 
 /**
@@ -1088,8 +1090,8 @@ void libOpenIMU_PrintFrame(void)
     printf(" mag(uT)=%.3f,%.3f,%.3f",
            pFrame->mag_uT[0], pFrame->mag_uT[1], pFrame->mag_uT[2]);
 #endif
-#if LIBOPENIMU_ATLEAST_ONE_PRINT
 
+#if LIBOPENIMU_ATLEAST_ONE_PRINT
     printf("\r\n");
-    #endif
+#endif
 }
