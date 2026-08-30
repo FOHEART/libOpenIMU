@@ -36,10 +36,10 @@ extern "C" {
  * @{
  */
 
-/** @brief OpenIMU 算法滤波类型（与 AT+CONFIG=algFilterType 取值一致） */
+/** @brief OpenIMU 旋转矢量算法类型（决定四元数 token：XFPK_Base→quat_base，XFPK_Additional→quat_additional） */
 typedef enum {
-	XFPK_Base = 0,        /**< 游戏旋转矢量（仅陀螺仪+加速度计） */
-	XFPK_Additional = 1   /**< 标准旋转矢量（陀螺仪+加速度计+磁力计，默认） */
+	XFPK_Base = 0,        /**< 游戏旋转矢量（仅陀螺仪+加速度计，对应 quat_base） */
+	XFPK_Additional = 1   /**< 标准旋转矢量（陀螺仪+加速度计+磁力计，默认，对应 quat_additional） */
 }XFPK_Type;
 
 /** @brief OpenIMU 上传格式（经 libOpenIMU_Init 参数指定，替代编译期宏） */
@@ -49,15 +49,35 @@ typedef enum {
 }libOpenIMU_UploadFormat;
 
 /** @brief OpenIMU 上传内容位域（按 bit 自由组合，经 libOpenIMU_Init 参数指定）
- * 位掩码决定上传哪几组数据：四元数/加速度/角速度/磁力计，可任意按位或组合
+ * 位掩码决定上传哪几组数据，按新 AT+UPLOADFORMAT 格式映射为模组 token，可任意按位或组合：
+ *   姿态 token（互斥，只能选一个）：quat_base / quat_additional / euler_base / euler_additional
+ *   附加传感器：accel/gyro/mag 的 raw 与 cali
+ * 通用四元数意图位 IMU_RAW_QUAT 由调用方（portable 层）按 AlgFilterType 解析为显式姿态位；
+ * 显式姿态位优先。
  */
 typedef enum IMU_rawType_e {
-	IMU_RAW_QUAT  = ( 1 << 0 ),  /**< 四元数（4 个 float） */
-	IMU_RAW_ACCEL = ( 1 << 1 ),  /**< 加速度计（3 个 float） */
-	IMU_RAW_GYRO  = ( 1 << 2 ),  /**< 陀螺仪（3 个 float） */
-	IMU_RAW_MAG   = ( 1 << 3 ),  /**< 磁力计（3 个 float） */
-	IMU_RAW_ALL   = ( IMU_RAW_QUAT | IMU_RAW_ACCEL | IMU_RAW_GYRO | IMU_RAW_MAG )  /**< 全选（默认，与既有全量行为一致） */
+	IMU_RAW_QUAT_BASE        = ( 1 << 0 ),  /**< 游戏旋转矢量四元数 quat_base（4 个 float） */
+	IMU_RAW_QUAT_ADDITIONAL  = ( 1 << 1 ),  /**< 标准旋转矢量四元数 quat_additional（4 个 float） */
+	IMU_RAW_EULER_BASE       = ( 1 << 2 ),  /**< 游戏旋转矢量欧拉角 euler_base（3 个 float） */
+	IMU_RAW_EULER_ADDITIONAL = ( 1 << 3 ),  /**< 标准旋转矢量欧拉角 euler_additional（3 个 float） */
+	IMU_RAW_ACCEL_RAW        = ( 1 << 4 ),  /**< 加速度计原始值 accel_raw（3 个 float） */
+	IMU_RAW_ACCEL_CALI       = ( 1 << 5 ),  /**< 加速度计校准值 accel_cali（3 个 float） */
+	IMU_RAW_GYRO_RAW         = ( 1 << 6 ),  /**< 陀螺仪原始值 gyro_raw（3 个 float） */
+	IMU_RAW_GYRO_CALI        = ( 1 << 7 ),  /**< 陀螺仪校准值 gyro_cali（3 个 float） */
+	IMU_RAW_MAG_RAW          = ( 1 << 8 ),  /**< 磁力计原始值 mag_raw（3 个 float） */
+	IMU_RAW_MAG_CALI         = ( 1 << 9 ),  /**< 磁力计校准值 mag_cali（3 个 float） */
+	IMU_RAW_QUAT             = ( 1 << 10 ), /**< 通用四元数意图位（变体由调用方按 AlgFilterType 解析为显式姿态位） */
+	/* 兼容组别名（旧组名默认映射校准值） */
+	IMU_RAW_ACCEL            = IMU_RAW_ACCEL_CALI,  /**< 组别名：加速度计校准值 */
+	IMU_RAW_GYRO             = IMU_RAW_GYRO_CALI,   /**< 组别名：陀螺仪校准值 */
+	IMU_RAW_MAG              = IMU_RAW_MAG_CALI,    /**< 组别名：磁力计校准值 */
+	IMU_RAW_ALL              = ( IMU_RAW_QUAT | IMU_RAW_ACCEL_CALI | IMU_RAW_GYRO_CALI | IMU_RAW_MAG_CALI )  /**< 全量（通用 quat + cali 三件套；默认解析为 quat_additional,accel_cali,gyro_cali,mag_cali） */
 }IMU_rawType;
+
+/** @def IMU_RAW_ATTITUDE_MASK
+ * @brief 显式姿态 token 位掩码（互斥，只能选一个）
+ */
+#define IMU_RAW_ATTITUDE_MASK ( IMU_RAW_QUAT_BASE | IMU_RAW_QUAT_ADDITIONAL | IMU_RAW_EULER_BASE | IMU_RAW_EULER_ADDITIONAL )
 
 /** @brief OpenIMU 模组支持的 UART 波特率（与 AT+UARTCFG 取值一致） */
 typedef enum {
@@ -79,11 +99,10 @@ typedef enum {
 	LIBOPENIMU_STATE_SET_CONFIG_MODE         = 1,  /*!< 发送 AT+MODE=config，等待 OK */
 	LIBOPENIMU_STATE_SET_BAUDRATE            = 2,  /*!< 按目标波特率配置模组波特率（可选，AT+UARTCFG） */
 	LIBOPENIMU_STATE_SET_LED_OFF             = 3,  /*!< 发送 AT+SETLED=OFF，关闭状态 LED */
-	LIBOPENIMU_STATE_SET_ALG_FILTER          = 4,  /*!< 发送 AT+CONFIG=algFilterType,<value>，应用算法滤波类型 */
-	LIBOPENIMU_STATE_SET_UPLOADFORMAT        = 5,  /*!< 发送 AT+UPLOADFORMAT=string,quat,accel,gyro,mag，等待 OK */
-	LIBOPENIMU_STATE_VERIFY_UPLOADFORMAT     = 6,  /*!< 发送 AT+UPLOADFORMAT=?，校验上传格式生效 */
-	LIBOPENIMU_STATE_SET_REQUEST_MEASUREMENT = 7,  /*!< 发送 AT+MODE=requestMeasurement，等待 OK */
-	LIBOPENIMU_STATE_MEASUREMENT             = 8   /*!< 稳态：AT+requestFrame 逐帧请求并解析 */
+	LIBOPENIMU_STATE_SET_UPLOADFORMAT        = 4,  /*!< 发送 AT+UPLOADFORMAT=string,quat_additional,accel_cali,gyro_cali,mag_cali，等待 OK */
+	LIBOPENIMU_STATE_VERIFY_UPLOADFORMAT     = 5,  /*!< 发送 AT+UPLOADFORMAT=?，校验上传格式生效 */
+	LIBOPENIMU_STATE_SET_REQUEST_MEASUREMENT = 6,  /*!< 发送 AT+MODE=requestMeasurement，等待 OK */
+	LIBOPENIMU_STATE_MEASUREMENT             = 7   /*!< 稳态：AT+requestFrame 逐帧请求并解析 */
 }libOpenIMU_State;
 
 /** @} */
@@ -96,11 +115,15 @@ typedef enum {
 #pragma pack(1)
 typedef struct
 {
-	uint32_t timestampMs;      /*!< 接收到该帧的时间 ms */
-	float    quat_wxyz[4];     /*!< 四元数 w,x,y,z */
-	float    accel_g[3];       /*!< 加速度计 x,y,z（g） */
-	float    gyro_dps[3];      /*!< 陀螺仪 x,y,z（°/s） */
-	float    mag_uT[3];       /*!< 磁力计 x,y,z（模组 µT 原始值，不换算） */
+	uint32_t timestampMs;        /*!< 接收到该帧的时间 ms */
+	float    quat_wxyz[4];       /*!< 四元数 w,x,y,z（quat_base / quat_additional） */
+	float    euler_deg[3];       /*!< 欧拉角 x,y,z（°）（euler_base / euler_additional） */
+	float    accel_raw_g[3];     /*!< 加速度计原始值 x,y,z（g） */
+	float    accel_g[3];         /*!< 加速度计校准值 x,y,z（g） */
+	float    gyro_raw_dps[3];    /*!< 陀螺仪原始值 x,y,z（°/s） */
+	float    gyro_dps[3];        /*!< 陀螺仪校准值 x,y,z（°/s） */
+	float    mag_raw_uT[3];      /*!< 磁力计原始值 x,y,z（µT） */
+	float    mag_uT[3];          /*!< 磁力计校准值 x,y,z（µT） */
 }libOpenIMU_Frame;
 #pragma pack()
 
@@ -137,9 +160,12 @@ typedef struct
 #define LIBOPENIMU_BOOT_INIT_DELAY_MS (500)
 
 /** @def LIBOPENIMU_UPLOADFORMAT_BUF_SIZE
- * @brief 上传格式命令/校验串缓冲区大小（按全选 4 组最大长度计，64 字节足够）
+ * @brief 上传格式命令/校验串缓冲区大小
+ *        按新 token 全选最大长度计（姿态 1 个 + accel/gyro/mag 的 raw/cali 共 7 个 token）：
+ *        "AT+UPLOADFORMAT=string,quat_additional,accel_raw,accel_cali,gyro_raw,gyro_cali,mag_raw,mag_cali\r\n"
+ *        共约 99 字节 + NUL，取 128 足够
  */
-#define LIBOPENIMU_UPLOADFORMAT_BUF_SIZE (64)
+#define LIBOPENIMU_UPLOADFORMAT_BUF_SIZE (128)
 
 /** @brief OpenIMU 模块运行状态
  * 由 portable 层实例化，指针传入 libOpenIMU_Init
@@ -153,7 +179,6 @@ typedef struct
 	bool cmdPending;                       /*!< 当前状态已发送命令，等待响应 */
 	bool formatSeen;                       /*!< 校验状态：已看到期望的 +UploadFormat 行 */
 	bool frameValid;                       /*!< 最新帧是否有效 */
-	XFPK_Type algFilterType;               /*!< 算法滤波类型（配置阶段应用） */
 	libOpenIMU_UploadFormat uploadFormat;  /*!< 上传格式（libOpenIMU_Init 参数传入） */
 	IMU_rawType IMU_rawType;               /*!< 上传内容组合位域（libOpenIMU_Init 参数传入） */
 	char uploadFormatCmdStr[LIBOPENIMU_UPLOADFORMAT_BUF_SIZE];   /*!< 动态生成 AT+UPLOADFORMAT=string,<list>\r\n */
@@ -178,7 +203,8 @@ typedef struct
  * @param pIo          平台 IO 抽象（时间与串口读写回调），不能为 NULL
  * @param pInst        模块运行状态实例，不能为 NULL
  * @param uploadFormat 上传格式（字符串 CSV 或二进制 JustFloat）
- * @param IMU_rawType  上传内容组合位域（四元数/加速度/角速度/磁力计自由组合；传 IMU_RAW_ALL 表示全量，与旧行为一致）
+ * @param IMU_rawType  上传内容组合位域（姿态/加速度/角速度/磁力计的全部 10 个 token 自由组合；
+ *                     传 IMU_RAW_ALL 表示全量，默认经调用方解析为 quat_additional,accel_cali,gyro_cali,mag_cali）
  * @param targetBaud   目标波特率（传具体值如 LIBOPENIMU_BAUD_3000000 时，探测后把模组配置为该波特率；传 LIBOPENIMU_BAUD_UNKNOWN 表示不更改，保持探测值）
  * @note 需在调用本函数前完成底层串口（UART6）初始化
  */

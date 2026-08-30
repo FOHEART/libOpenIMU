@@ -185,7 +185,8 @@ void libOpenIMU_Portable_Init( libOpenIMU_UploadFormat uploadFormat, IMU_rawType
    ```c
    libOpenIMU_Poll();
    ```
-   - 内部是**非阻塞状态机**：开机自动完成 config 模式 → （可选）设置目标波特率 → LED 关闭 → 设置滤波类型 → 设置上传格式 → 校验 → 进入 requestMeasurement 稳态；
+   - 内部是**非阻塞状态机**：开机自动完成 config 模式 → （可选）设置目标波特率 → LED 关闭 → 设置上传格式 → 校验 → 进入 requestMeasurement 稳态；
+   - 上传格式内容按 `IMU_rawType` 动态生成新格式 token（`quat_base`/`quat_additional`、`accel_cali`、`gyro_cali`、`mag_cali`）；四元数 token 随 `algFilterType`（`XFPK_Base`→`quat_base`，`XFPK_Additional`→`quat_additional`），默认 `XFPK_Additional` 即 `quat_additional`；
    - 稳态下每次 `Poll` 发送 `AT+requestFrame` 并等待 ≤3ms 解析一帧。
    - 初始化阶段（非 MEASUREMENT）命令发送受 **100ms 最小发送间隔**（`LIBOPENIMU_CMD_SEND_INTERVAL_MS`）节流，给模组反应时间；重试/状态间不会立即连发。
    - 无需额外延时/定时器调度，直接放进你的采样循环即可。
@@ -273,7 +274,7 @@ SET_CONFIG_MODE（AT+MODE=config，进入 config 模式——AT+UARTCFG 仅 conf
 | 发送间隔 | `LIBOPENIMU_CMD_SEND_INTERVAL_MS`（`libopenimu.c`，默认 100） | 初始化阶段（非 MEASUREMENT）两次 AT 命令发送的最小间隔 ms，给模组反应时间，避免立即重试/连发 |
 | 开机等待延时 | `libOpenIMU_IO.bootInitDelayMs` / `LIBOPENIMU_BOOT_INIT_DELAY_MS`（`libopenimu.h`） | 上电后等待模组初始化完成（默认 300ms），`libOpenIMU_Portable_Init` 开机流程使用 |
 | 模组电源 | `libOpenIMU_IO.powerOn` / `powerOff` | 开机流程断电/上电；无电源控制需求时可置空并去掉对应时序 |
-| 滤波类型 | `getXfpkType()` 返回值 | `XFPK_Base`（游戏旋转矢量）/ `XFPK_Additional`（标准，默认）；配置阶段发 `AT+CONFIG=algFilterType,<value>` |
+| 滤波类型 | `getXfpkType()` 返回值 | `XFPK_Base`（游戏旋转矢量）/ `XFPK_Additional`（标准，默认）；决定上传格式四元数 token（`XFPK_Base`→`quat_base`，`XFPK_Additional`→`quat_additional`） |
 | 状态 LED | 自动 | config 模式发 `AT+SETLED=OFF` 关闭 |
 | 调试打印 | `LIBOPENIMU_DEBUG_PRINT`（`libopenimu.c`） | 置 1 打印原始 RX/响应行/超时状态 |
 
@@ -289,8 +290,7 @@ SET_CONFIG_MODE（AT+MODE=config，进入 config 模式——AT+UARTCFG 仅 conf
   → SET_CONFIG_MODE    (AT+MODE=config)
   → SET_BAUDRATE       (可选：目标波特率配置 AT+UARTCFG；targetBaud==UNKNOWN/探测值 或 setBaudrate==NULL 时跳过)
   → SET_LED_OFF        (AT+SETLED=OFF)
-  → SET_ALG_FILTER     (AT+CONFIG=algFilterType,<value>)
-  → SET_UPLOADFORMAT   (AT+UPLOADFORMAT=<string|hex>,<按 IMU_rawType 动态生成的内容列表>)
+  → SET_UPLOADFORMAT   (AT+UPLOADFORMAT=<string|hex>,<按 IMU_rawType 动态生成的内容列表：quat_base/quat_additional、accel_cali、gyro_cali、mag_cali>)
   → VERIFY_UPLOADFORMAT(AT+UPLOADFORMAT=? 校验，期望串按 IMU_rawType 动态生成)
   → SET_REQUEST_MEASUREMENT (AT+MODE=requestMeasurement)
   → MEASUREMENT(稳态：AT+requestFrame 逐帧请求并解析)

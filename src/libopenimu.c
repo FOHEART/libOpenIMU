@@ -29,14 +29,6 @@
  */
 #define LIBOPENIMU_CMD_SET_LED_OFF "AT+SETLED=OFF\r\n"
 /**
- * @brief AT command: set algorithm filter to XFPK_Base (game rotation vector) | AT指令：设置算法滤波类型为XFPK_Base（游戏旋转矢量）
- */
-#define LIBOPENIMU_CMD_SET_ALG_FILTER_BASE "AT+CONFIG=algFilterType,XFPK_Base\r\n"
-/**
- * @brief AT command: set algorithm filter to XFPK_Additional (standard rotation vector) | AT指令：设置算法滤波类型为XFPK_Additional（标准旋转矢量）
- */
-#define LIBOPENIMU_CMD_SET_ALG_FILTER_ADDITIONAL "AT+CONFIG=algFilterType,XFPK_Additional\r\n"
-/**
  * @brief AT command: query the upload format | AT指令：查询上传格式
  */
 #define LIBOPENIMU_CMD_QUERY_UPLOADFORMAT "AT+UPLOADFORMAT=?\r\n"
@@ -77,14 +69,15 @@
  */
 #define LIBOPENIMU_CMD_SEND_INTERVAL_MS (100)
 /**
- * @brief Max expected float count (all groups: quat4+accel3+gyro3+mag3=13), for the local parse buffer | 最大期望float个数（全选quat4+accel3+gyro3+mag3=13），局部解析缓冲用
+ * @brief Max expected float count (all 10 tokens: quat4+accel/gyro/mag raw+cali 6*3=22), for the local parse buffer | 最大期望float个数（全10 token：quat4+accel/gyro/mag的raw+cali共6*3=22），局部解析缓冲用
  * @note The actual expected count is generated at runtime from the IMU_rawType bitmask in libOpenIMU_BuildUploadFormat and stored in frameFloatCount | 实际期望个数由IMU_rawType位掩码在libOpenIMU_BuildUploadFormat运行时生成并存入frameFloatCount
  */
-#define LIBOPENIMU_FRAME_FLOAT_CNT_MAX (13)
+#define LIBOPENIMU_FRAME_FLOAT_CNT_MAX (22)
 /**
  * @brief Caller line buffer size (one AT response / data-frame line) | 调用方行缓冲大小（AT响应/数据帧一行）
+ * @note Full 10-token string frame is at most ~176 chars + \r\n + NUL, so 192 is safe | 全10 token字符串帧最长约176字节+\r\n+NUL，192足够
  */
-#define LIBOPENIMU_LINE_BUF_SIZE (128)
+#define LIBOPENIMU_LINE_BUF_SIZE (192)
 /** @} */
 
 /**
@@ -343,7 +336,7 @@ static bool libOpenIMU_RxReadLine(char *outLine, uint16_t outMax)
  * @brief Return the AT command to send for the current state | 返回当前状态应发送的AT指令
  * @param state Current initialization state | 当前初始化状态
  * @return Command string, or NULL for states with no command | 指令字符串；无指令的状态返回NULL
- * @note SET_ALG_FILTER/SET_UPLOADFORMAT commands depend on the runtime-configured algFilterType/uploadFormat | SET_ALG_FILTER/SET_UPLOADFORMAT指令取决于运行时配置的algFilterType/uploadFormat
+ * @note SET_UPLOADFORMAT command depends on the runtime-configured uploadFormat/IMU_rawType | SET_UPLOADFORMAT指令取决于运行时配置的uploadFormat/IMU_rawType
  */
 static const char *libOpenIMU_CmdForState(libOpenIMU_State state)
 {
@@ -353,10 +346,6 @@ static const char *libOpenIMU_CmdForState(libOpenIMU_State state)
         return LIBOPENIMU_CMD_SET_CONFIG_MODE;
     case LIBOPENIMU_STATE_SET_LED_OFF:
         return LIBOPENIMU_CMD_SET_LED_OFF;
-    case LIBOPENIMU_STATE_SET_ALG_FILTER:
-        return (sLibOpenIMU->algFilterType == XFPK_Base)
-                   ? LIBOPENIMU_CMD_SET_ALG_FILTER_BASE
-                   : LIBOPENIMU_CMD_SET_ALG_FILTER_ADDITIONAL;
     case LIBOPENIMU_STATE_SET_UPLOADFORMAT:
         return (sLibOpenIMU->uploadFormat == LIBOPENIMU_UPLOAD_FORMAT_STRING)
                    ? sLibOpenIMU->uploadFormatCmdStr
@@ -567,13 +556,42 @@ static void libOpenIMU_InitStepSetBaudrate(void)
     }
 }
 
+/** @brief 上传 token 映射（bit → 模组 token 名 → float 个数），按固定输出顺序排列 */
+typedef struct
+{
+    IMU_rawType bit;      /*!< 位掩码 */
+    const char *token;    /*!< 模组 token 名 */
+    uint8_t     floats;   /*!< 该 token 的 float 个数 */
+} IMU_TokenMap_TypeDef;
+
+/** @brief 固定输出顺序：姿态 → accel_raw → accel_cali → gyro_raw → gyro_cali → mag_raw → mag_cali
+ * （与 ATCMD.md §6.1 模组输出顺序一致，命令按同序生成）
+ */
+static const IMU_TokenMap_TypeDef IMU_TokenTable[] =
+{
+    { IMU_RAW_QUAT_BASE,        "quat_base",        4 },
+    { IMU_RAW_QUAT_ADDITIONAL,  "quat_additional",  4 },
+    { IMU_RAW_EULER_BASE,       "euler_base",       3 },
+    { IMU_RAW_EULER_ADDITIONAL, "euler_additional", 3 },
+    { IMU_RAW_ACCEL_RAW,        "accel_raw",        3 },
+    { IMU_RAW_ACCEL_CALI,       "accel_cali",       3 },
+    { IMU_RAW_GYRO_RAW,         "gyro_raw",         3 },
+    { IMU_RAW_GYRO_CALI,        "gyro_cali",        3 },
+    { IMU_RAW_MAG_RAW,          "mag_raw",          3 },
+    { IMU_RAW_MAG_CALI,         "mag_cali",         3 },
+};
+#define IMU_TOKEN_TABLE_SIZE ( sizeof( IMU_TokenTable ) / sizeof( IMU_TokenTable[0] ) )
+
 /**
  * @brief Dynamically build the upload-format command, expected string and frame length | 按IMU_rawType位掩码动态生成上传格式命令、校验串与期望帧长
- * @param rawType Selected data-group bitmask | 选中的数据组位掩码
+ * @param rawType Selected token bitmask | 选中的 token 位掩码
  * @param fmt Upload format (string or hex) | 上传格式（字符串或十六进制）
  * @return void
- * @note Builds the data-group list in fixed order quat→accel→gyro→mag (matches module output order).
- *       An empty combination (0) falls back to all groups to avoid an illegal empty list command | 按固定顺序quat→accel→gyro→mag生成数据组列表（与模组输出顺序一致）；空组合（0）回退为全选
+ * @note Table-driven token list in fixed order attitude→accel_raw→accel_cali→gyro_raw→gyro_cali→mag_raw→mag_cali,
+ *       matching the module output order (ATCMD §6.1). Illegal masks are safely resolved:
+ *       empty→IMU_RAW_ALL, multiple attitude→quat_additional, no attitude→prepend quat_additional.
+ *       The generic IMU_RAW_QUAT intent is resolved to quat_additional only on the direct-driver path
+ *       (the portable layer resolves it per AlgFilterType before calling libOpenIMU_Init). | 表驱动按固定顺序生成token列表；非法位掩码安全回退（空→全选、多姿态→quat_additional、无姿态→补quat_additional）；通用IMU_RAW_QUAT仅在直传驱动路径下按quat_additional解析
  */
 static void libOpenIMU_BuildUploadFormat(IMU_rawType rawType, libOpenIMU_UploadFormat fmt)
 {
@@ -581,6 +599,7 @@ static void libOpenIMU_BuildUploadFormat(IMU_rawType rawType, libOpenIMU_UploadF
     char *p = list;
     size_t rem = sizeof(list);
     uint8_t floatCount = 0;
+    uint8_t attitudeCount = 0;
     const char *fmtName;
 
     /* 空组合安全策略：未选中任何数据组时回退全选（保持既有全量行为） */
@@ -588,37 +607,54 @@ static void libOpenIMU_BuildUploadFormat(IMU_rawType rawType, libOpenIMU_UploadF
     {
         printf("[OpenIMU] IMU_rawType=0, fallback to IMU_RAW_ALL.\r\n");
         rawType = IMU_RAW_ALL;
-        sLibOpenIMU->IMU_rawType = rawType;
     }
 
-    /* 按固定顺序生成数据组列表（逗号分隔） */
-    if (rawType & IMU_RAW_QUAT)
+    /* 显式姿态位计数（互斥校验） */
+    attitudeCount = (uint8_t)( ((rawType & IMU_RAW_QUAT_BASE)        ? 1 : 0)
+                             + ((rawType & IMU_RAW_QUAT_ADDITIONAL)  ? 1 : 0)
+                             + ((rawType & IMU_RAW_EULER_BASE)       ? 1 : 0)
+                             + ((rawType & IMU_RAW_EULER_ADDITIONAL) ? 1 : 0) );
+
+    if (attitudeCount > 1)
     {
-        int n = snprintf(p, rem, "%squat", (p == list) ? "" : ",");
-        p += n;
-        rem -= (size_t)n;
-        floatCount += 4;
+        /* 多个姿态 token：模组只允许一个，回退为 quat_additional */
+        printf("[OpenIMU] multiple attitude tokens, fallback to quat_additional.\r\n");
+        rawType &= ~( IMU_RAW_ATTITUDE_MASK | IMU_RAW_QUAT );
+        rawType |= IMU_RAW_QUAT_ADDITIONAL;
     }
-    if (rawType & IMU_RAW_ACCEL)
+    else if (attitudeCount == 1)
     {
-        int n = snprintf(p, rem, "%saccel", (p == list) ? "" : ",");
-        p += n;
-        rem -= (size_t)n;
-        floatCount += 3;
+        /* 显式姿态位优先：清除通用 quat 意图标记 */
+        rawType &= ~IMU_RAW_QUAT;
     }
-    if (rawType & IMU_RAW_GYRO)
+    else /* attitudeCount == 0 */
     {
-        int n = snprintf(p, rem, "%sgyro", (p == list) ? "" : ",");
-        p += n;
-        rem -= (size_t)n;
-        floatCount += 3;
+        if (rawType & IMU_RAW_QUAT)
+        {
+            /* 通用 quat 意图位（直传驱动路径的防御性默认）：按 quat_additional 处理 */
+            printf("[OpenIMU] generic IMU_RAW_QUAT -> quat_additional.\r\n");
+            rawType &= ~IMU_RAW_QUAT;
+            rawType |= IMU_RAW_QUAT_ADDITIONAL;
+        }
+        else
+        {
+            /* 有附加传感器但无姿态位：模组要求必须含姿态 token，否则其它数据无法读取，补 quat_additional */
+            printf("[OpenIMU] no attitude token, prepend quat_additional.\r\n");
+            rawType |= IMU_RAW_QUAT_ADDITIONAL;
+        }
     }
-    if (rawType & IMU_RAW_MAG)
+    sLibOpenIMU->IMU_rawType = rawType;
+
+    /* 表驱动按固定顺序生成 token 列表（逗号分隔），与模组输出顺序一致 */
+    for (size_t i = 0; i < IMU_TOKEN_TABLE_SIZE; i++)
     {
-        int n = snprintf(p, rem, "%smag", (p == list) ? "" : ",");
-        p += n;
-        rem -= (size_t)n;
-        floatCount += 3;
+        if (rawType & IMU_TokenTable[i].bit)
+        {
+            int n = snprintf(p, rem, "%s%s", (p == list) ? "" : ",", IMU_TokenTable[i].token);
+            p += n;
+            rem -= (size_t)n;
+            floatCount += IMU_TokenTable[i].floats;
+        }
     }
 
     /* 生成字符串/二进制两条 AT 命令与校验期望串 */
@@ -655,11 +691,79 @@ static uint32_t libOpenIMU_TmrElapsedUs(uint32_t startUs)
 
 /* === 字符串（STRING）格式解析 === */
 /**
+ * @brief Copy n floats from values (starting at *idx) into dst | 从values（*idx起）复制n个float到dst
+ * @return void
+ */
+static void libOpenIMU_DispatchCopy(const float *values, int *idx, float *dst, uint8_t n)
+{
+    for (uint8_t i = 0; i < n; i++)
+    {
+        dst[i] = values[(*idx)++];
+    }
+}
+
+/**
+ * @brief Dispatch parsed float values into libOpenIMU_Frame by the fixed token order | 按固定token顺序把解析值分发到libOpenIMU_Frame各字段
+ * @details Order matches the module output order (attitude → accel_raw → accel_cali → gyro_raw → gyro_cali → mag_raw → mag_cali).
+ *          Only the tokens selected in IMU_rawType are filled; unselected groups stay 0 (memset at init) | 顺序与模组输出一致；仅填充IMU_rawType选中的token，未选中组保持0
+ * @param values Parsed float array | 解析后的float数组
+ * @param idx Pointer to the read offset (advanced) | 读取偏移（自动推进）
+ * @return void
+ */
+static void libOpenIMU_DispatchTokens(const float *values, int *idx)
+{
+    IMU_rawType rt = sLibOpenIMU->IMU_rawType;
+
+    /* 姿态 token（互斥，已由 BuildUploadFormat 校验） */
+    if (rt & IMU_RAW_QUAT_BASE)
+    {
+        libOpenIMU_DispatchCopy(values, idx, sLibOpenIMU->frame.quat_wxyz, 4);
+    }
+    if (rt & IMU_RAW_QUAT_ADDITIONAL)
+    {
+        libOpenIMU_DispatchCopy(values, idx, sLibOpenIMU->frame.quat_wxyz, 4);
+    }
+    if (rt & IMU_RAW_EULER_BASE)
+    {
+        libOpenIMU_DispatchCopy(values, idx, sLibOpenIMU->frame.euler_deg, 3);
+    }
+    if (rt & IMU_RAW_EULER_ADDITIONAL)
+    {
+        libOpenIMU_DispatchCopy(values, idx, sLibOpenIMU->frame.euler_deg, 3);
+    }
+    /* 附加传感器：raw 与 cali */
+    if (rt & IMU_RAW_ACCEL_RAW)
+    {
+        libOpenIMU_DispatchCopy(values, idx, sLibOpenIMU->frame.accel_raw_g, 3);
+    }
+    if (rt & IMU_RAW_ACCEL_CALI)
+    {
+        libOpenIMU_DispatchCopy(values, idx, sLibOpenIMU->frame.accel_g, 3);
+    }
+    if (rt & IMU_RAW_GYRO_RAW)
+    {
+        libOpenIMU_DispatchCopy(values, idx, sLibOpenIMU->frame.gyro_raw_dps, 3);
+    }
+    if (rt & IMU_RAW_GYRO_CALI)
+    {
+        libOpenIMU_DispatchCopy(values, idx, sLibOpenIMU->frame.gyro_dps, 3);
+    }
+    if (rt & IMU_RAW_MAG_RAW)
+    {
+        libOpenIMU_DispatchCopy(values, idx, sLibOpenIMU->frame.mag_raw_uT, 3);
+    }
+    if (rt & IMU_RAW_MAG_CALI)
+    {
+        libOpenIMU_DispatchCopy(values, idx, sLibOpenIMU->frame.mag_uT, 3);
+    }
+}
+
+/**
  * @brief Parse one line of a string-format frame into libOpenIMU_Frame | 解析一行字符串帧到libOpenIMU_Frame
  * @details Parses the comma-separated floats (count = frameFloatCount) | 解析逗号分隔浮点数（个数=frameFloatCount）
  * @param line Pointer to the frame line | 帧行字符串指针
  * @return true = parsed OK and the latest valid frame was updated; false = parse failed | true=解析成功并更新最新有效帧；false=解析失败
- * @note Only the groups selected in IMU_rawType are filled; unselected groups stay 0 | 仅填充IMU_rawType选中的组，未选中组保持0
+ * @note Only the tokens selected in IMU_rawType are filled; unselected groups stay 0 | 仅填充IMU_rawType选中的token，未选中组保持0
  */
 static bool libOpenIMU_ParseFrame(const char *line)
 {
@@ -701,32 +805,8 @@ static bool libOpenIMU_ParseFrame(const char *line)
 
     sLibOpenIMU->frame.timestampMs = sLibOpenIMU_IO->getTickMs();
 
-    /* 按固定顺序 quat→accel→gyro→mag 分发到被选中组，未选中组保持 0（初始化已 memset） */
-    if (sLibOpenIMU->IMU_rawType & IMU_RAW_QUAT)
-    {
-        sLibOpenIMU->frame.quat_wxyz[0] = values[idx++];
-        sLibOpenIMU->frame.quat_wxyz[1] = values[idx++];
-        sLibOpenIMU->frame.quat_wxyz[2] = values[idx++];
-        sLibOpenIMU->frame.quat_wxyz[3] = values[idx++];
-    }
-    if (sLibOpenIMU->IMU_rawType & IMU_RAW_ACCEL)
-    {
-        sLibOpenIMU->frame.accel_g[0] = values[idx++];
-        sLibOpenIMU->frame.accel_g[1] = values[idx++];
-        sLibOpenIMU->frame.accel_g[2] = values[idx++];
-    }
-    if (sLibOpenIMU->IMU_rawType & IMU_RAW_GYRO)
-    {
-        sLibOpenIMU->frame.gyro_dps[0] = values[idx++];
-        sLibOpenIMU->frame.gyro_dps[1] = values[idx++];
-        sLibOpenIMU->frame.gyro_dps[2] = values[idx++];
-    }
-    if (sLibOpenIMU->IMU_rawType & IMU_RAW_MAG)
-    {
-        sLibOpenIMU->frame.mag_uT[0] = values[idx++];
-        sLibOpenIMU->frame.mag_uT[1] = values[idx++];
-        sLibOpenIMU->frame.mag_uT[2] = values[idx++];
-    }
+    /* 按固定 token 顺序分发到被选中组，未选中组保持 0（初始化已 memset） */
+    libOpenIMU_DispatchTokens(values, &idx);
 
     sLibOpenIMU->frameValid = true;
     return true;
@@ -774,56 +854,28 @@ static float libOpenIMU_BytesToFloatLE(const uint8_t *p)
 
 /**
  * @brief Parse binary-format frame data | 解析二进制格式帧数据
- * @details Contains only little-endian floats of the IMU_rawType-selected groups, no trailer | 仅含IMU_rawType选中组的小端float，无帧尾
+ * @details Contains only little-endian floats of the IMU_rawType-selected tokens, no trailer | 仅含IMU_rawType选中token的小端float，无帧尾
  * @param data Pointer to the raw frame bytes | 原始帧数据指针
  * @return void
- * @note Order: quat(4) → accel(3) → gyro(3) → mag(3) | 顺序：quat(4) → accel(3) → gyro(3) → mag(3)
+ * @note Order matches the fixed token order (attitude → accel_raw → accel_cali → gyro_raw → gyro_cali → mag_raw → mag_cali) | 顺序与固定token顺序一致
  */
 static void libOpenIMU_ParseHexFrameData(const uint8_t *data)
 {
+    float values[LIBOPENIMU_FRAME_FLOAT_CNT_MAX];
     uint32_t off = 0;
+    int idx = 0;
+
+    /* 按帧内 float 总数（frameFloatCount）读取 little-endian float */
+    for (uint8_t i = 0; i < sLibOpenIMU->frameFloatCount; i++)
+    {
+        values[i] = libOpenIMU_BytesToFloatLE(data + off);
+        off += 4;
+    }
 
     sLibOpenIMU->frame.timestampMs = sLibOpenIMU_IO->getTickMs();
 
-    /* 按固定顺序 quat→accel→gyro→mag 解析被选中组，未选中组保持 0（初始化已 memset） */
-    if (sLibOpenIMU->IMU_rawType & IMU_RAW_QUAT)
-    {
-        sLibOpenIMU->frame.quat_wxyz[0] = libOpenIMU_BytesToFloatLE(data + off);
-        off += 4;
-        sLibOpenIMU->frame.quat_wxyz[1] = libOpenIMU_BytesToFloatLE(data + off);
-        off += 4;
-        sLibOpenIMU->frame.quat_wxyz[2] = libOpenIMU_BytesToFloatLE(data + off);
-        off += 4;
-        sLibOpenIMU->frame.quat_wxyz[3] = libOpenIMU_BytesToFloatLE(data + off);
-        off += 4;
-    }
-    if (sLibOpenIMU->IMU_rawType & IMU_RAW_ACCEL)
-    {
-        sLibOpenIMU->frame.accel_g[0] = libOpenIMU_BytesToFloatLE(data + off);
-        off += 4;
-        sLibOpenIMU->frame.accel_g[1] = libOpenIMU_BytesToFloatLE(data + off);
-        off += 4;
-        sLibOpenIMU->frame.accel_g[2] = libOpenIMU_BytesToFloatLE(data + off);
-        off += 4;
-    }
-    if (sLibOpenIMU->IMU_rawType & IMU_RAW_GYRO)
-    {
-        sLibOpenIMU->frame.gyro_dps[0] = libOpenIMU_BytesToFloatLE(data + off);
-        off += 4;
-        sLibOpenIMU->frame.gyro_dps[1] = libOpenIMU_BytesToFloatLE(data + off);
-        off += 4;
-        sLibOpenIMU->frame.gyro_dps[2] = libOpenIMU_BytesToFloatLE(data + off);
-        off += 4;
-    }
-    if (sLibOpenIMU->IMU_rawType & IMU_RAW_MAG)
-    {
-        sLibOpenIMU->frame.mag_uT[0] = libOpenIMU_BytesToFloatLE(data + off);
-        off += 4;
-        sLibOpenIMU->frame.mag_uT[1] = libOpenIMU_BytesToFloatLE(data + off);
-        off += 4;
-        sLibOpenIMU->frame.mag_uT[2] = libOpenIMU_BytesToFloatLE(data + off);
-        off += 4;
-    }
+    /* 按固定 token 顺序分发到被选中组，未选中组保持 0（初始化已 memset） */
+    libOpenIMU_DispatchTokens(values, &idx);
 
     sLibOpenIMU->frameValid = true;
 }
@@ -961,9 +1013,9 @@ void libOpenIMU_Init(libOpenIMU_IO *pIo, libOpenIMU_TypeDef *pInst, libOpenIMU_U
     sLibOpenIMU = pInst;
     memset(sLibOpenIMU, 0, sizeof(*sLibOpenIMU));
     sLibOpenIMU->uploadFormat = uploadFormat;
-    sLibOpenIMU->algFilterType = sLibOpenIMU_IO->getXfpkType();
 
-    /* 保存上传内容组合并动态生成上传格式命令/校验串/期望帧长（未选中组经 memset 保持 0） */
+    /* 保存上传内容组合并动态生成上传格式命令/校验串/期望帧长（未选中组经 memset 保持 0）；
+     * quat 变体已由调用方（portable 层）按 AlgFilterType 解析为显式姿态位，驱动不再读取 algFilterType */
     sLibOpenIMU->IMU_rawType = IMU_rawType;
     libOpenIMU_BuildUploadFormat(IMU_rawType, uploadFormat);
 
@@ -998,7 +1050,6 @@ void libOpenIMU_Poll(void)
 
     case LIBOPENIMU_STATE_SET_CONFIG_MODE:
     case LIBOPENIMU_STATE_SET_LED_OFF:
-    case LIBOPENIMU_STATE_SET_ALG_FILTER:
     case LIBOPENIMU_STATE_SET_UPLOADFORMAT:
     case LIBOPENIMU_STATE_VERIFY_UPLOADFORMAT:
     case LIBOPENIMU_STATE_SET_REQUEST_MEASUREMENT:
